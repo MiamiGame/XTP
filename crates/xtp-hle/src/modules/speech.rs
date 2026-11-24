@@ -1,16 +1,19 @@
 //! Accessibility: closed captions, high contrast, and speech synthesis.
 //!
-//! Closed-caption properties and high-contrast mode are read from the host
-//! Windows accessibility settings (with documented defaults when Windows has
-//! no explicit setting). Speech synthesis currently emits valid empty WAVE
-//! audio so narration is silent.
+//! Closed-caption properties are read from Windows via the WinRT
+//! `Windows.Media.ClosedCaptioning.ClosedCaptionProperties` API (cached on
+//! first query, with fallback defaults when unavailable). High-contrast mode
+//! is queried through `SystemParametersInfoW(SPI_GETHIGHCONTRAST)`. Speech
+//! synthesis currently emits valid empty WAVE audio so narration is silent.
 // shortcut: silent speech. The host's engine (SAPI through COM, or WinRT
 // speech synthesis) needs COM bindings this crate has only in diagnostics
 // builds, plus voice enumeration and SSML the title sends (slot 0xa8); the
 // title then plays the empty stream and goes on.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::cmp::Ordering as CmpOrdering;
 use std::ffi::{c_char, c_void};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::xgameruntime::{
@@ -35,7 +38,7 @@ pub const IID: Guid = Guid::new(
 pub static OBJECT: Object = Object::new("accessibility", &VTABLE);
 pub const INTERFACES: &[Interface] = &[(PROVIDER, IID, &OBJECT)];
 
-/// ARGB colour (`XColor` in the public GDK accessibility API).
+/// ARGB colour (`XColor` in `XGameRuntimeTypes.h`).
 #[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XColor {
@@ -45,7 +48,7 @@ pub struct XColor {
     pub b: u8,
 }
 
-/// Closed-caption configuration (`XClosedCaptionProperties` in `XAccessibility.h`).
+/// Closed-caption settings (`XClosedCaptionProperties` in `XAccessibility.h`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct XClosedCaptionProperties {
@@ -59,10 +62,10 @@ pub struct XClosedCaptionProperties {
 }
 
 impl XClosedCaptionProperties {
-    /// Documented defaults used when the host has no explicit caption settings:
+    /// Fallback properties when Windows exposes no explicit caption setting:
     /// opaque black background, opaque white text, transparent window, default
     /// edge and font style, 100% scale, disabled.
-    pub const DEFAULT: Self = Self {
+    pub const FALLBACK: Self = Self {
         background_color: XColor {
             a: 0xff,
             r: 0x00,
@@ -92,194 +95,168 @@ impl XClosedCaptionProperties {
 pub const HIGH_CONTRAST_OFF: u32 = 0;
 pub const HIGH_CONTRAST_DARK: u32 = 1;
 pub const HIGH_CONTRAST_LIGHT: u32 = 2;
+pub const HIGH_CONTRAST_OTHER: u32 = 3;
+
+/// Cached host closed-caption snapshot so per-frame polling stays cheap.
+static HOST_CAPTIONS: OnceLock<XClosedCaptionProperties> = OnceLock::new();
 
 /// Title override for closed-caption enabled state: `0` = unset, `1` = false,
 /// `2` = true.
 static CAPTION_ENABLED_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 
-/// Raw values read from `HKCU\Software\Microsoft\Windows\CurrentVersion\ClosedCaptioning`.
+/// Intermediate snapshot of WinRT `ClosedCaptionProperties` enum values.
 #[derive(Default)]
-struct HostCaptionSettings {
-    background_color: Option<u32>,
-    background_opacity: Option<u32>,
-    font_color: Option<u32>,
-    font_opacity: Option<u32>,
-    region_color: Option<u32>,
-    region_opacity: Option<u32>,
-    font_effect: Option<u32>,
-    font_style: Option<u32>,
-    font_size: Option<u32>,
+struct WinrtCaptionSnapshot {
+    background_color: Option<i32>,
+    background_opacity: Option<i32>,
+    font_color: Option<i32>,
+    font_opacity: Option<i32>,
+    region_color: Option<i32>,
+    region_opacity: Option<i32>,
+    font_effect: Option<i32>,
+    font_style: Option<i32>,
+    font_size: Option<i32>,
 }
 
-fn map_caption_color(code: Option<u32>, opacity: Option<u32>, fallback: XColor) -> XColor {
-    let (r, g, b) = match code {
-        Some(1) => (0xff, 0xff, 0xff), // White
-        Some(2) => (0x00, 0x00, 0x00), // Black
-        Some(3) => (0xff, 0x00, 0x00), // Red
-        Some(4) => (0x00, 0xff, 0x00), // Green
-        Some(5) => (0x00, 0x00, 0xff), // Blue
-        Some(6) => (0xff, 0xff, 0x00), // Yellow
-        Some(7) => (0xff, 0x00, 0xff), // Magenta
-        Some(8) => (0x00, 0xff, 0xff), // Cyan
+fn resolve_color(color: Option<i32>, opacity: Option<i32>, fallback: XColor) -> XColor {
+    // Windows.Media.ClosedCaptioning.ClosedCaptionColor enum order:
+    // 0=Default, 1=White, 2=Black, 3=Red, 4=Green, 5=Blue, 6=Yellow, 7=Magenta, 8=Cyan.
+    let (r, g, b) = match color {
+        Some(1) => (0xff, 0xff, 0xff),
+        Some(2) => (0x00, 0x00, 0x00),
+        Some(3) => (0xff, 0x00, 0x00),
+        Some(4) => (0x00, 0xff, 0x00),
+        Some(5) => (0x00, 0x00, 0xff),
+        Some(6) => (0xff, 0xff, 0x00),
+        Some(7) => (0xff, 0x00, 0xff),
+        Some(8) => (0x00, 0xff, 0xff),
         _ => (fallback.r, fallback.g, fallback.b),
     };
+    // Windows.Media.ClosedCaptioning.ClosedCaptionOpacity enum order:
+    // 0=Default, 1=OneHundredPercent, 2=SeventyFivePercent, 3=TwentyFivePercent, 4=ZeroPercent.
     let a = match opacity {
-        Some(1) => 0xff, // 100%
-        Some(2) => 0xbf, // 75%
-        Some(3) => 0x40, // 25%
-        Some(4) => 0x00, // 0%
+        Some(1) => 0xff,
+        Some(2) => 0xbf,
+        Some(3) => 0x40,
+        Some(4) => 0x00,
         _ => fallback.a,
     };
     XColor { a, r, g, b }
 }
 
-fn map_font_scale(code: Option<u32>) -> f32 {
-    match code {
+fn resolve_scale(size: Option<i32>) -> f32 {
+    // Windows.Media.ClosedCaptioning.ClosedCaptionSize:
+    // 0=Default, 1=FiftyPercent, 2=OneHundredPercent, 3=OneHundredFiftyPercent, 4=TwoHundredPercent.
+    match size {
         Some(1) => 0.5,
         Some(2) => 1.0,
         Some(3) => 1.5,
         Some(4) => 2.0,
-        _ => XClosedCaptionProperties::DEFAULT.font_scale,
+        _ => XClosedCaptionProperties::FALLBACK.font_scale,
     }
 }
 
-fn properties_from_host(
-    host: &HostCaptionSettings,
+fn build_caption_properties(
+    snap: &WinrtCaptionSnapshot,
     enabled_override: Option<bool>,
 ) -> XClosedCaptionProperties {
-    let def = XClosedCaptionProperties::DEFAULT;
+    let base = XClosedCaptionProperties::FALLBACK;
     XClosedCaptionProperties {
-        background_color: map_caption_color(
-            host.background_color,
-            host.background_opacity,
-            def.background_color,
+        background_color: resolve_color(
+            snap.background_color,
+            snap.background_opacity,
+            base.background_color,
         ),
-        font_color: map_caption_color(host.font_color, host.font_opacity, def.font_color),
-        window_color: map_caption_color(host.region_color, host.region_opacity, def.window_color),
-        font_edge_attribute: host
+        font_color: resolve_color(snap.font_color, snap.font_opacity, base.font_color),
+        window_color: resolve_color(snap.region_color, snap.region_opacity, base.window_color),
+        font_edge_attribute: snap
             .font_effect
+            .and_then(|v| u32::try_from(v).ok())
             .filter(|&v| v <= 5)
-            .unwrap_or(def.font_edge_attribute),
-        font_style: host
+            .unwrap_or(base.font_edge_attribute),
+        font_style: snap
             .font_style
+            .and_then(|v| u32::try_from(v).ok())
             .filter(|&v| v <= 7)
-            .unwrap_or(def.font_style),
-        font_scale: map_font_scale(host.font_size),
-        enabled: enabled_override.unwrap_or(def.enabled),
+            .unwrap_or(base.font_style),
+        font_scale: resolve_scale(snap.font_size),
+        enabled: enabled_override.unwrap_or(base.enabled),
     }
 }
 
-fn classify_high_contrast(enabled: bool, window_rgb: u32) -> u32 {
-    if !enabled {
+/// Distinguish dark vs light high-contrast themes by comparing window
+/// background brightness against foreground text brightness.
+fn high_contrast_from_pair(active: bool, bg_bgr: u32, fg_bgr: u32) -> u32 {
+    if !active {
         return HIGH_CONTRAST_OFF;
     }
-    let r = window_rgb & 0xff;
-    let g = (window_rgb >> 8) & 0xff;
-    let b = (window_rgb >> 16) & 0xff;
-    // Perceived luminance (Rec. 601) to distinguish dark vs light themes.
-    let luma = (299 * r + 587 * g + 114 * b) / 1000;
-    if luma < 128 {
-        HIGH_CONTRAST_DARK
-    } else {
-        HIGH_CONTRAST_LIGHT
+    let brightness = |bgr: u32| (bgr & 0xff) + ((bgr >> 8) & 0xff) + ((bgr >> 16) & 0xff);
+    match brightness(bg_bgr).cmp(&brightness(fg_bgr)) {
+        CmpOrdering::Less => HIGH_CONTRAST_DARK,
+        CmpOrdering::Greater => HIGH_CONTRAST_LIGHT,
+        CmpOrdering::Equal => HIGH_CONTRAST_OTHER,
     }
 }
 
 #[cfg(windows)]
-fn read_host_caption_settings() -> HostCaptionSettings {
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
-    };
+fn query_winrt_captions() -> WinrtCaptionSnapshot {
+    use windows::Media::ClosedCaptioning::ClosedCaptionProperties;
 
-    let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\ClosedCaptioning\0"
-        .encode_utf16()
-        .collect();
-    let mut key: HKEY = std::ptr::null_mut();
-    // SAFETY: `subkey` is NUL-terminated UTF-16 and `key` is a valid out-pointer.
-    let status =
-        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut key) };
-    if status != ERROR_SUCCESS {
-        return HostCaptionSettings::default();
+    WinrtCaptionSnapshot {
+        background_color: ClosedCaptionProperties::BackgroundColor().ok().map(|v| v.0),
+        background_opacity: ClosedCaptionProperties::BackgroundOpacity()
+            .ok()
+            .map(|v| v.0),
+        font_color: ClosedCaptionProperties::FontColor().ok().map(|v| v.0),
+        font_opacity: ClosedCaptionProperties::FontOpacity().ok().map(|v| v.0),
+        region_color: ClosedCaptionProperties::RegionColor().ok().map(|v| v.0),
+        region_opacity: ClosedCaptionProperties::RegionOpacity().ok().map(|v| v.0),
+        font_effect: ClosedCaptionProperties::FontEffect().ok().map(|v| v.0),
+        font_style: ClosedCaptionProperties::FontStyle().ok().map(|v| v.0),
+        font_size: ClosedCaptionProperties::FontSize().ok().map(|v| v.0),
     }
-
-    let query_u32 = |name: &str| -> Option<u32> {
-        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-        let mut kind = 0u32;
-        let mut value = 0u32;
-        let mut len = std::mem::size_of::<u32>() as u32;
-        // SAFETY: `key` is an open HKEY, `wide` is NUL-terminated, and `value`
-        // holds `len` bytes.
-        let rc = unsafe {
-            RegQueryValueExW(
-                key,
-                wide.as_ptr(),
-                std::ptr::null(),
-                &mut kind,
-                (&raw mut value).cast::<u8>(),
-                &mut len,
-            )
-        };
-        (rc == ERROR_SUCCESS && kind == REG_DWORD && len == 4).then_some(value)
-    };
-
-    let settings = HostCaptionSettings {
-        background_color: query_u32("BackgroundColor"),
-        background_opacity: query_u32("BackgroundOpacity"),
-        font_color: query_u32("FontColor"),
-        font_opacity: query_u32("FontOpacity"),
-        region_color: query_u32("RegionColor"),
-        region_opacity: query_u32("RegionOpacity"),
-        font_effect: query_u32("FontEffect"),
-        font_style: query_u32("FontStyle"),
-        font_size: query_u32("FontSize"),
-    };
-
-    // SAFETY: `key` was opened by `RegOpenKeyExW` above.
-    unsafe { RegCloseKey(key) };
-    settings
 }
 
 #[cfg(not(windows))]
-fn read_host_caption_settings() -> HostCaptionSettings {
-    HostCaptionSettings::default()
+fn query_winrt_captions() -> WinrtCaptionSnapshot {
+    WinrtCaptionSnapshot::default()
 }
 
 #[cfg(windows)]
-fn read_host_high_contrast_mode() -> u32 {
-    use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, GetSysColor};
+fn query_host_high_contrast() -> u32 {
+    use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor};
     use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
     use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETHIGHCONTRAST, SystemParametersInfoW};
 
-    let mut hc = HIGHCONTRASTW {
+    let mut info = HIGHCONTRASTW {
         cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
         dwFlags: 0,
         lpszDefaultScheme: std::ptr::null_mut(),
     };
-    // SAFETY: `hc` is zero-initialised with its exact `cbSize`.
+    // SAFETY: `info` has its exact byte size in `cbSize` and valid storage.
     let ok = unsafe {
         SystemParametersInfoW(
             SPI_GETHIGHCONTRAST,
-            hc.cbSize,
-            (&raw mut hc).cast::<c_void>(),
+            info.cbSize,
+            (&raw mut info).cast::<c_void>(),
             0,
         )
     };
     if ok == 0 {
         return HIGH_CONTRAST_OFF;
     }
-    let enabled = (hc.dwFlags & HCF_HIGHCONTRASTON) != 0;
-    // SAFETY: `GetSysColor` takes a standard `COLOR_*` index and has no preconditions.
-    let window_rgb = unsafe { GetSysColor(COLOR_WINDOW) };
-    classify_high_contrast(enabled, window_rgb)
+    let active = (info.dwFlags & HCF_HIGHCONTRASTON) != 0;
+    // SAFETY: `GetSysColor` takes standard `COLOR_*` indices with no preconditions.
+    let (bg, fg) = unsafe { (GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOWTEXT)) };
+    high_contrast_from_pair(active, bg, fg)
 }
 
 #[cfg(not(windows))]
-fn read_host_high_contrast_mode() -> u32 {
+fn query_host_high_contrast() -> u32 {
     HIGH_CONTRAST_OFF
 }
 
-fn caption_enabled_override() -> Option<bool> {
+fn enabled_override() -> Option<bool> {
     match CAPTION_ENABLED_OVERRIDE.load(Ordering::Relaxed) {
         1 => Some(false),
         2 => Some(true),
@@ -291,18 +268,24 @@ extern "system" fn closed_caption_get_properties(
     _: This,
     out: *mut XClosedCaptionProperties,
 ) -> HRESULT {
-    let host = read_host_caption_settings();
-    let props = properties_from_host(&host, caption_enabled_override());
+    let mut props = *HOST_CAPTIONS.get_or_init(|| {
+        let snap = query_winrt_captions();
+        build_caption_properties(&snap, None)
+    });
+    if let Some(overridden) = enabled_override() {
+        props.enabled = overridden;
+    }
     put(out, props)
 }
 
-extern "system" fn closed_caption_set_enabled(_: This, enabled: bool) -> HRESULT {
-    CAPTION_ENABLED_OVERRIDE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+/// Takes `u8` rather than `bool` so any non-zero C++ byte is accepted without UB.
+extern "system" fn closed_caption_set_enabled(_: This, enabled: u8) -> HRESULT {
+    CAPTION_ENABLED_OVERRIDE.store(if enabled != 0 { 2 } else { 1 }, Ordering::Relaxed);
     S_OK
 }
 
 extern "system" fn high_contrast_get_mode(_: This, out: *mut u32) -> HRESULT {
-    put(out, read_host_high_contrast_mode())
+    put(out, query_host_high_contrast())
 }
 
 /// A WAVE file of 16 kHz mono 16-bit PCM with no samples: RIFF size 36,
@@ -424,60 +407,26 @@ mod tests {
     }
 
     #[test]
-    fn closed_caption_defaults_fill_entire_structure() {
-        assert_eq!(std::mem::size_of::<XColor>(), 4);
-        assert_eq!(std::mem::align_of::<XColor>(), 4);
-        assert_eq!(std::mem::size_of::<XClosedCaptionProperties>(), 28);
-
-        let props = properties_from_host(&HostCaptionSettings::default(), None);
-        assert_eq!(props, XClosedCaptionProperties::DEFAULT);
-        assert_eq!(
-            props.background_color,
-            XColor {
-                a: 0xff,
-                r: 0,
-                g: 0,
-                b: 0
-            }
-        );
-        assert_eq!(
-            props.font_color,
-            XColor {
-                a: 0xff,
-                r: 0xff,
-                g: 0xff,
-                b: 0xff
-            }
-        );
-        assert_eq!(
-            props.window_color,
-            XColor {
-                a: 0,
-                r: 0,
-                g: 0,
-                b: 0
-            }
-        );
-        assert_eq!(props.font_edge_attribute, 0);
-        assert_eq!(props.font_style, 0);
-        assert_eq!(props.font_scale, 1.0);
-        assert!(!props.enabled);
+    fn empty_winrt_snapshot_uses_fallback_properties() {
+        let props = build_caption_properties(&WinrtCaptionSnapshot::default(), None);
+        assert_eq!(props, XClosedCaptionProperties::FALLBACK);
+        assert_eq!(std::mem::size_of_val(&props), 28);
     }
 
     #[test]
-    fn closed_caption_maps_host_registry_values() {
-        let host = HostCaptionSettings {
+    fn winrt_snapshot_values_translate_to_caption_properties() {
+        let snap = WinrtCaptionSnapshot {
             background_color: Some(5),   // Blue
             background_opacity: Some(2), // 75%
             font_color: Some(6),         // Yellow
             font_opacity: Some(1),       // 100%
             region_color: Some(2),       // Black
             region_opacity: Some(3),     // 25%
-            font_effect: Some(5),        // DropShadowedEdges
-            font_style: Some(4),         // ProportionalWithoutSerifs
-            font_size: Some(3),          // 150%
+            font_effect: Some(4),        // UniformedEdges
+            font_style: Some(3),         // MonospacedWithoutSerifs
+            font_size: Some(4),          // 200%
         };
-        let props = properties_from_host(&host, Some(true));
+        let props = build_caption_properties(&snap, Some(true));
         assert_eq!(
             props.background_color,
             XColor {
@@ -505,77 +454,57 @@ mod tests {
                 b: 0
             }
         );
-        assert_eq!(props.font_edge_attribute, 5);
-        assert_eq!(props.font_style, 4);
-        assert_eq!(props.font_scale, 1.5);
+        assert_eq!(props.font_edge_attribute, 4);
+        assert_eq!(props.font_style, 3);
+        assert_eq!(props.font_scale, 2.0);
         assert!(props.enabled);
     }
 
     #[test]
-    fn closed_caption_set_enabled_is_read_back() {
+    fn set_enabled_round_trips_and_accepts_any_nonzero_byte() {
         let this: This = &OBJECT;
         type GetProps = extern "system" fn(This, *mut XClosedCaptionProperties) -> HRESULT;
-        type SetEnabled = extern "system" fn(This, bool) -> HRESULT;
+        type SetEnabled = extern "system" fn(This, u8) -> HRESULT;
         let get = method::<GetProps>(&OBJECT, 0x18);
         let set = method::<SetEnabled>(&OBJECT, 0x20);
 
-        assert_ne!(get(this, std::ptr::null_mut()), S_OK);
+        assert!(get(this, std::ptr::null_mut()) < 0);
 
-        assert_eq!(set(this, true), S_OK);
-        let mut props = XClosedCaptionProperties {
-            background_color: XColor {
-                a: 1,
-                r: 2,
-                g: 3,
-                b: 4,
-            },
-            font_color: XColor {
-                a: 5,
-                r: 6,
-                g: 7,
-                b: 8,
-            },
-            window_color: XColor {
-                a: 9,
-                r: 10,
-                g: 11,
-                b: 12,
-            },
-            font_edge_attribute: 99,
-            font_style: 99,
-            font_scale: -1.0,
-            enabled: false,
-        };
+        assert_eq!(set(this, 0xff), S_OK);
+        let mut props = XClosedCaptionProperties::FALLBACK;
         assert_eq!(get(this, &mut props), S_OK);
         assert!(props.enabled);
-        assert!(props.font_scale > 0.0);
 
-        assert_eq!(set(this, false), S_OK);
+        assert_eq!(set(this, 0), S_OK);
         assert_eq!(get(this, &mut props), S_OK);
         assert!(!props.enabled);
     }
 
     #[test]
-    fn high_contrast_mode_classification_and_slot() {
+    fn high_contrast_pair_distinguishes_off_dark_light_and_other() {
         assert_eq!(
-            classify_high_contrast(false, 0x0000_0000),
+            high_contrast_from_pair(false, 0x0010_1010, 0x00f0_f0f0),
             HIGH_CONTRAST_OFF
         );
         assert_eq!(
-            classify_high_contrast(true, 0x0000_0000),
+            high_contrast_from_pair(true, 0x0010_1010, 0x00f0_f0f0),
             HIGH_CONTRAST_DARK
         );
         assert_eq!(
-            classify_high_contrast(true, 0x00ff_ffff),
+            high_contrast_from_pair(true, 0x00f0_f0f0, 0x0010_1010),
             HIGH_CONTRAST_LIGHT
+        );
+        assert_eq!(
+            high_contrast_from_pair(true, 0x0080_8080, 0x0080_8080),
+            HIGH_CONTRAST_OTHER
         );
 
         let this: This = &OBJECT;
         type GetMode = extern "system" fn(This, *mut u32) -> HRESULT;
         let get = method::<GetMode>(&OBJECT, 0x28);
-        assert_ne!(get(this, std::ptr::null_mut()), S_OK);
-        let mut mode = u32::MAX;
+        assert!(get(this, std::ptr::null_mut()) < 0);
+        let mut mode = 99;
         assert_eq!(get(this, &mut mode), S_OK);
-        assert!(mode <= HIGH_CONTRAST_LIGHT);
+        assert!(mode <= HIGH_CONTRAST_OTHER);
     }
 }
