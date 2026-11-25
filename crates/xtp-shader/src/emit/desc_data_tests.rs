@@ -11,7 +11,8 @@
 //! - a buffer the program only tests for its record count: its entry's
 //!   view, or the stride table's count;
 //! - a sampler's dword joined with data at a branch: undefined on the
-//!   sampler's edge, the data on the other; read directly, it stops;
+//!   sampler's edge where no lane that takes it reads the register, the
+//!   data on the other; read directly, or on its edge, it stops;
 //! - with the stride table, the count and the scalar loads of a buffer
 //!   read by element go through the table's raw view, not the slot's own
 //!   (the Codex review of rawfix, P1); an MTBUF access's count is in
@@ -228,6 +229,9 @@ fn run(
                 [bits as u32, (bits >> 32) as u32]
             })
             .collect();
+        // The table's header first (`emit::STRIDE_HEADER`): every slot mirrored.
+        let n = strides.len() as u32;
+        let data = [vec![0, n, 0, n], data].concat();
         roots.push((1, Root::View { srv: true, data }));
     }
     let (root, pso) = host.compute_pipeline(cs).expect("a pipeline");
@@ -533,14 +537,25 @@ fn an_mtbuf_accesss_record_count_is_in_elements() {
     }
 }
 
+/// Where [`sampler_joined`] reads s17.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Read {
+    /// With no branch before: the sampler's dword read directly.
+    Direct,
+    /// After the join, in every lane: on the sampler's edge, its dword.
+    Joined,
+    /// After the join, behind the flag tested again: only where the scalar
+    /// load overwrote the sampler's dword.
+    Retested,
+}
+
 /// The material programs' shape (`f23ac5187c49056a`): a sampler (s1's
 /// table) samples an image (s0's table, entry 0); then, unless a flag the
 /// program reads (dword 1 of the raw buffer at entry 16) is 0, a scalar
 /// load of the buffer's dword 0 overwrites the sampler's dword 1, and each
 /// lane stores what the register holds after the join at 4 × the lane of
-/// the UAV at entry 8. With `joined` false it is stored with no branch
-/// before: the sampler's dword read directly.
-fn sampler_joined(joined: bool) -> NativeProgram {
+/// the UAV at entry 8, as `read` says.
+fn sampler_joined(read: Read) -> NativeProgram {
     let mut w = vec![s_mov(5, ZERO), s_mov(4, 0), s_mov(7, ZERO), s_mov(6, 1)];
     w.extend(smem(3, 8, 4, 0, NULL));
     w.extend(smem(2, 16, 6, 0, NULL));
@@ -548,11 +563,15 @@ fn sampler_joined(joined: bool) -> NativeProgram {
     w.extend(smem(2, 24, 4, 0x40, NULL));
     w.extend([v_mov(2, ZERO), v_mov(3, ZERO), WAIT_SCALAR]);
     w.extend(IMAGE_SAMPLE_LZ);
-    if joined {
+    if read != Read::Direct {
         w.extend(smem(8, 28, 24, 4, NULL));
         w.extend([WAIT_SCALAR, s_cmp_eq_u32(28, ZERO), s_cbranch_scc1(3)]);
         w.extend(smem(8, 17, 24, 0, NULL));
         w.push(WAIT_SCALAR);
+    }
+    if read == Read::Retested {
+        // Over the store's four dwords.
+        w.extend([s_cmp_eq_u32(28, ZERO), s_cbranch_scc1(4)]);
     }
     w.extend([v_mov(1, 17), v_lshl(8, 2, 0)]);
     w.extend(mubuf(STORE_DWORD, 1, 8, 20, true, false));
@@ -571,27 +590,23 @@ fn sampler_joined(joined: bool) -> NativeProgram {
 }
 
 /// No program reads a sampler's dwords as numbers: where one meets data at
-/// a join, the register is dead on the sampler's edge (undefined there),
-/// and holds the data on the other (77 with the flag set). Read directly,
-/// the sampler's dword has no value: it stops, as a descriptor's address
-/// does.
+/// a join and the lanes that take the sampler's edge never read the
+/// register (the flag tested again, `lower/flow.rs`: `unread_on_edge`),
+/// it is dead on that edge (undefined there), and holds the data on the
+/// other: 77 with the flag set, nothing stored with it clear. Read
+/// directly, or after the join on the sampler's edge too (the review of
+/// w7skin), the sampler's dword has no value: it stops, as a descriptor's
+/// address does.
 #[test]
 fn a_samplers_dword_joined_with_data_is_dead_on_its_edge() {
-    assert_eq!(
-        refusal(&sampler_joined(false), Target::ANY),
-        Some("a descriptor's address or format read as data")
-    );
-    let cs = translate(&sampler_joined(true), Target::ANY).expect("translated");
-    let data = [77, 1, 0, 0];
+    for read in [Read::Direct, Read::Joined] {
+        assert_eq!(
+            refusal(&sampler_joined(read), Target::ANY),
+            Some("a descriptor's address or format read as data")
+        );
+    }
+    let cs = translate(&sampler_joined(Read::Retested), Target::ANY).expect("translated");
     let texel = [[0.25; 4]];
-    let views = [
-        View::Texture(1, 1, &texel),
-        View::RawUav(LANES),
-        View::Buffer {
-            data: &data,
-            stride: Stride::Raw,
-        },
-    ];
     let point = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -601,10 +616,21 @@ fn a_samplers_dword_joined_with_data_is_dead_on_its_edge() {
         MaxLOD: f32::MAX,
         ..Default::default()
     };
-    let Some(out) = run(&cs, &views, &[point], &[]) else {
-        return;
-    };
-    assert_eq!(out[0], vec![77; LANES as usize]);
+    for (flag, want) in [(1, 77), (0, 0)] {
+        let data = [77, flag, 0, 0];
+        let views = [
+            View::Texture(1, 1, &texel),
+            View::RawUav(LANES),
+            View::Buffer {
+                data: &data,
+                stride: Stride::Raw,
+            },
+        ];
+        let Some(out) = run(&cs, &views, &[point], &[]) else {
+            return;
+        };
+        assert_eq!(out[0], vec![want; LANES as usize], "flag {flag}");
+    }
 }
 
 /// Two loads of a heap slot (s1) at the same offset (s12, slot 1): the

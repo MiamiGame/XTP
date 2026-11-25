@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{Lower, Stop, Val, Why, packed_half, packed_partners};
 use crate::emit::UserData;
-use crate::emit::bitcode::{Attr, Bin, Cast, V};
+use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::container::SigElement;
 use crate::emit::shader::flags;
 use crate::gfx10::{Fields, Operand};
@@ -70,24 +70,31 @@ fn packed_input_half(
     }
 }
 
+/// Terme auquel s'ajoute le produit du poids par la différence des sommets.
+#[derive(Debug, Clone, Copy)]
+enum InterpBase {
+    P0,
+    Accumulator(V),
+    Zero,
+}
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
     /// Loaded with this DXIL interpolation mode (1: constant, P0).
     Mode(u8),
-    /// From the vertex values of a constant element: P0 when `p0`, plus
-    /// i (P1 - P0), plus j (P2 - P0), weights as floats.
+    /// Somme de la base et des termes pondérés I (P1 − P0) et J (P2 − P0).
     Weights {
-        p0: bool,
+        base: InterpBase,
         i: Option<V>,
         j: Option<V>,
     },
 }
 
 impl<'a> Lower<'a> {
-    /// A temporary SGPR can hold a wave mask on one edge and pixel data
-    /// on another. Follow the former edge until the SGPR is overwritten:
-    /// only substitute padding when no instruction can observe its bits.
+    /// Un SGPR temporaire peut contenir un masque ou un descripteur sur une
+    /// branche et des données sur l'autre. Suivre la première jusqu'à la
+    /// prochaine écriture pour vérifier qu'aucune lecture ne voit ses bits.
     pub(super) fn unused_pixel_sgpr(&self, reg: Reg, pred: usize, join: usize) -> bool {
         if !self.s.pixel || self.x.io.initialized_sgprs.is_none() || !matches!(reg, Reg::S(0..=105))
         {
@@ -526,6 +533,85 @@ impl<'a> Lower<'a> {
         Val::I32(self.s.m.extract(entry, r, index % 4))
     }
 
+    /// Ported from fxceless's VIctory fork #646 (head 170c24269) by mynzjerko,
+    /// après VICTORY_THREAD_DIMS de Yorivel (2521646b8).
+    /// Les threads de queue participent aux barrières. Les effets et les
+    /// votes utilisent ce prédicat, y compris dans les groupes fractionnés.
+    pub(super) fn dispatch_threads(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        let e = self.s.entry;
+        for (axis, dim) in cs
+            .threads
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, dim)| dim > 1)
+        {
+            let limit = self.host_word(crate::emit::DISPATCH_THREADS, 0, axis as u32);
+            let group = self.group_id(axis as u8);
+            let Val::I32(thread) = self.input(Input::ThreadIdInGroup(axis as u8)) else {
+                unreachable!()
+            };
+            let zero = self.s.m.i32(0);
+            let size = self.s.m.i32(dim);
+            let whole = self.s.m.bin(e, Bin::UDiv, limit, size);
+            let tail = self.s.m.bin(e, Bin::URem, limit, size);
+            let full_group = self.s.m.cmp(e, pred::IULT, group, whole);
+            let last_group = self.s.m.cmp(e, pred::EQ, group, whole);
+            let in_tail = self.s.m.cmp(e, pred::IULT, thread, tail);
+            let in_tail = self.s.m.bin(e, Bin::And, last_group, in_tail);
+            let enabled = self.s.m.bin(e, Bin::Or, full_group, in_tail);
+            let unlimited = self.s.m.cmp(e, pred::EQ, limit, zero);
+            let enabled = self.s.m.bin(e, Bin::Or, unlimited, enabled);
+            self.partial_active = Some(self.with_partial(e, enabled));
+        }
+    }
+
+    pub(super) fn with_partial(&mut self, at: usize, bit: V) -> V {
+        self.partial_active
+            .map_or(bit, |active| self.s.m.bin(at, Bin::And, active, bit))
+    }
+
+    /// Les dwords fournis par l'hôte suivent les arguments du titre.
+    pub(super) fn host_word(&mut self, root: RootType, slot: u8, dword: u32) -> V {
+        if let Some((_, v)) = self
+            .host_words
+            .iter()
+            .find(|(u, _)| (u.root, u.slot, u.dword) == (root, slot, dword))
+        {
+            return *v;
+        }
+        let index = self.host_words.len() as u32;
+        if index.is_multiple_of(4) {
+            self.host_rows.push(self.s.m.pending_i32());
+        }
+        let row = self.host_rows[index as usize / 4];
+        let h = *self
+            .user_data
+            .get_or_insert_with(|| self.s.user_data_handle());
+        let e = self.s.entry;
+        let values = self.s.op(
+            e,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.s.t.cbuf_ret,
+            59,
+            &[h, row],
+        );
+        let v = self.s.m.extract(e, values, index % 4);
+        self.host_words.push((
+            UserData {
+                index,
+                slot,
+                root,
+                dword,
+            },
+            v,
+        ));
+        v
+    }
+
     pub(super) fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
             return Err("the first half of an interpolation");
@@ -554,9 +640,6 @@ impl<'a> Lower<'a> {
             let x = l.operand(inst, &op.ok_or("an interpolation operand")?)?;
             Ok(l.as_float(x))
         };
-        // What the result adds to the evaluated channel (a second half's
-        // first half, when the halves evaluate on their own).
-        let mut add = None;
         let (attribute, eval) = match *interp {
             Interp::Interpolated {
                 attribute,
@@ -577,7 +660,7 @@ impl<'a> Lower<'a> {
                         *w = Some(self.as_float(x));
                     }
                     Eval::Weights {
-                        p0: true,
+                        base: InterpBase::P0,
                         i: ij[0],
                         j: ij[1],
                     }
@@ -601,7 +684,14 @@ impl<'a> Lower<'a> {
                 } else {
                     (None, one)
                 };
-                (attribute, Eval::Weights { p0: false, i, j })
+                (
+                    attribute,
+                    Eval::Weights {
+                        base: InterpBase::Zero,
+                        i,
+                        j,
+                    },
+                )
             }
             Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
             // A half of an interpolation with computed i or j: P0 + i P10,
@@ -611,7 +701,7 @@ impl<'a> Lower<'a> {
                 (
                     attribute,
                     Eval::Weights {
-                        p0: true,
+                        base: InterpBase::P0,
                         i,
                         j: None,
                     },
@@ -622,16 +712,9 @@ impl<'a> Lower<'a> {
                     Fields::Valu(v) => v.src.get(2).copied(),
                     _ => Some(dst),
                 };
-                add = Some(float(self, old)?);
+                let base = InterpBase::Accumulator(float(self, old)?);
                 let j = Some(float(self, src)?);
-                (
-                    attribute,
-                    Eval::Weights {
-                        p0: false,
-                        i: None,
-                        j,
-                    },
-                )
+                (attribute, Eval::Weights { base, i: None, j })
             }
         };
         // (pack2, the second row, whether the metadata names it).
@@ -651,25 +734,10 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let f16 = name.ends_with("_f16");
-        // The evaluated channel plus `add`, as a float.
-        let total = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
-            let x = l.eval_channel(row, ch, eval)?;
-            let x = l.as_float(x);
-            Ok(match add {
-                Some(a) => l.s.m.bin(l.cur, Bin::Add, a, x),
-                None => x,
-            })
-        };
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
             // Loaded as is: the bits the host interpolated.
-            None if add.is_none() && matches!(eval, Eval::Mode(_)) => {
-                self.eval_channel(attribute.row, attribute.channel, eval)?
-            }
-            None => {
-                let x = total(self, attribute.row, attribute.channel)?;
-                self.as_int(x)
-            }
+            None => self.eval_channel(attribute.row, attribute.channel, eval)?,
             Some((pack2, b, explicit_second_row)) => {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
@@ -682,7 +750,10 @@ impl<'a> Lower<'a> {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
                     match src {
-                        Some((row, ch)) => total(l, row, ch).map(Some),
+                        Some((row, ch)) => {
+                            let x = l.eval_channel(row, ch, eval)?;
+                            Ok(Some(l.as_float(x)))
+                        }
                         // shortcut: a 16-bit read of the padding after a
                         // second row the metadata names reads zero. The
                         // host declares no element there; the console's
@@ -775,7 +846,7 @@ impl<'a> Lower<'a> {
             return Err("one input interpolated two ways");
         }
         e.interp = mode;
-        let Eval::Weights { p0, i, j } = eval else {
+        let Eval::Weights { base, i, j } = eval else {
             return match self.load_any_input(id, col) {
                 Val::I32(x) => Ok(x),
                 _ => Err("an input"),
@@ -783,7 +854,11 @@ impl<'a> Lower<'a> {
         };
         let v0 = self.vertex_input(id, col, 0);
         let c = self.cur;
-        let mut acc = p0.then_some(v0);
+        let mut acc = match base {
+            InterpBase::P0 => Some(v0),
+            InterpBase::Accumulator(v) => Some(v),
+            InterpBase::Zero => None,
+        };
         for (k, w) in [(1, i), (2, j)] {
             let Some(w) = w else { continue };
             let vk = self.vertex_input(id, col, k);

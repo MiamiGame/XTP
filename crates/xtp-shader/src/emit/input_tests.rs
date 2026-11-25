@@ -80,7 +80,18 @@ fn native_pixel(words: &[u32], input_addr: u32, rsrc2: u32) -> NativeProgram {
 fn emit_pixel(native: &NativeProgram) -> Result<HostShader, ShaderError> {
     let mut target = element("SV_Target", 16, 0);
     target.usage = 15;
-    let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+    let StageIo::Ps { inputs, .. } = &native.io else {
+        unreachable!()
+    };
+    let rows: Vec<_> = inputs
+        .iter()
+        .map(|input| {
+            let mut e = element("TEXCOORD", 0, input.row.into());
+            e.index = input.attr.into();
+            e
+        })
+        .collect();
+    let isg1 = container::signature(&rows, true);
     let osg1 = container::signature(&[target], false);
     let bytes = dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
     let c = Container::parse(&bytes).unwrap();
@@ -107,11 +118,11 @@ fn validate(shader: &HostShader) {
     }
 }
 
-/// The `PSV0` interpolation mode of TEXCOORD0 (row 0, x-w, float).
-fn texcoord_mode(shader: &HostShader) -> u8 {
+/// Mode d’interpolation d’une ligne TEXCOORD float4 dans PSV0.
+fn texcoord_mode(shader: &HostShader, register: u8) -> u8 {
     let c = Container::parse(&shader.dxil).unwrap();
     let psv = c.part(FourCC::PSV0).unwrap().data;
-    let row = [1, 0, 0x44, 0, 3];
+    let row = [1, register, 0x44, 0, 3];
     let at = psv.windows(5).position(|w| w == row).unwrap();
     psv[at + 5]
 }
@@ -251,7 +262,7 @@ fn computed_barycentrics_read_the_vertices() {
     let (features, inputs) = parts(&shader);
     assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
     assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
-    assert_eq!(texcoord_mode(&shader), 1);
+    assert_eq!(texcoord_mode(&shader, 0), 1);
     validate(&shader);
 }
 
@@ -271,7 +282,7 @@ fn constant_weights_need_no_barycentrics() {
     let (features, inputs) = parts(&shader);
     assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
     assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
-    assert_eq!(texcoord_mode(&shader), 1);
+    assert_eq!(texcoord_mode(&shader, 0), 1);
     validate(&shader);
 }
 
@@ -295,7 +306,7 @@ fn computed_and_loaded_barycentrics_on_one_attribute() {
     let shader = pixel(&words, PERSP_CENTER).unwrap();
     let (_, inputs) = parts(&shader);
     assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
-    assert_eq!(texcoord_mode(&shader), 1);
+    assert_eq!(texcoord_mode(&shader, 0), 1);
     validate(&shader);
 }
 
@@ -313,12 +324,73 @@ fn p10_of_an_interpolated_attribute() {
         S_ENDPGM,
     ];
     let shader = pixel(&words, PERSP_CENTER).unwrap();
-    assert_eq!(texcoord_mode(&shader), 1);
+    assert_eq!(texcoord_mode(&shader, 0), 1);
     validate(&shader);
     // Alone, what the hardware holds is not known.
     let [e0, e1] = exp_mrt0(4);
     let words = [0xC812_0000, e0, e1, S_ENDPGM];
     assert!(pixel(&words, PERSP_CENTER).is_err());
+}
+
+/// Triangle couvrant 2 × 2 pixels. I vaut 1/8 ou 3/8 selon la colonne,
+/// J prend les mêmes valeurs selon la ligne. TEXCOORD0.x vaut 2, 10 et 50.
+fn draw_pixels(ps: &HostShader) -> Option<Vec<[f32; 4]>> {
+    use super::host::{Draw, Host};
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let host = match Host::new(true) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("WARP indisponible ({e})");
+            return None;
+        }
+    };
+    let mut attr = element("TEXCOORD", 0, 0);
+    attr.usage = 15;
+    attr.interp = 2;
+    let mut pos = element("SV_Position", 3, 1);
+    pos.usage = 15;
+    pos.interp = 4;
+    let positions = [[-1., 1., 0.5, 1.], [3., 1., 0.5, 1.], [-1., -3., 0.5, 1.]];
+    let vs = super::rect_gs::probe::with_outputs(vec![attr, pos], 3, |v, row, c| {
+        let value: f32 = if row == 0 {
+            [2., 10., 50.][v]
+        } else {
+            positions[v][c]
+        };
+        value.to_bits()
+    });
+    let vs = HostShader {
+        dxil: vs,
+        stage: HwStage::Vs,
+        user_data: vec![],
+        group_base: None,
+        samplers: vec![],
+        static_samplers: vec![],
+        root_cbvs: vec![],
+        root_srvs: vec![],
+        root_uavs: vec![],
+        stride_table: false,
+        run_time_buffers: 0,
+    };
+    let (root, pso) = host.pipeline(&vs, ps).unwrap();
+    Some(
+        host.draw(
+            &root,
+            &pso,
+            &Draw {
+                roots: vec![],
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (2, 2),
+                mesh_groups: 0,
+            },
+        )
+        .unwrap(),
+    )
 }
 
 #[test]
@@ -332,8 +404,11 @@ fn a_first_half_export_reads_only_i_and_the_first_two_vertices() {
         c.part(FourCC::ISG1).unwrap().data[8 + 32 * bary + 25],
         0b010
     );
-    assert_eq!(texcoord_mode(&out), 1);
+    assert_eq!(texcoord_mode(&out, 0), 1);
     validate(&out);
+    if let Some(pixels) = draw_pixels(&out) {
+        assert_eq!(pixels, [[3.; 4], [5.; 4], [3.; 4], [5.; 4]]);
+    }
 }
 
 #[test]
@@ -348,22 +423,82 @@ fn pixel_temporaries_begin_above_the_primitive_mask() {
 
 #[test]
 fn conditional_pixel_export_keeps_the_lane_for_later_exports() {
-    let [exp, data] = exp_mrt0(1);
+    let [exp, data] = exp_mrt0(2);
     let words = [
+        0x7e04_02f2, // v2 = 1
+        0x7e06_02f4, // v3 = 2
+        0x7e08_02f6, // v4 = 4
         exp & !0x1800,
-        data,        // initialize the target
-        0x7d84_0080, // v_cmp_eq_u32 vcc, 0, v0
-        0xbe8a_3c6a, // s_and_saveexec_b32 s10, vcc_lo
+        data,
+        0x7d84_00ff,
+        0.125f32.to_bits(), // I = 1/8 dans la colonne de gauche
+        0xbe8a_3c6a,        // s_and_saveexec_b32 s10, vcc_lo
         exp & !0x1800,
-        0,           // overwrite only in the selected lanes
+        0x0303_0303,
         0xbefe_030a, // s_mov_b32 exec_lo, s10
-        0xf800_1890,
-        0, // exp null done vm
+        0xf800_1808,
+        0x0400_0000, // alpha = 4 dans les deux colonnes
         S_ENDPGM,
     ];
     let out = pixel(&words, PERSP_CENTER).unwrap();
     assert!(!crate::emit::last_module_summary().contains("discard"));
     validate(&out);
+    if let Some(pixels) = draw_pixels(&out) {
+        let left = [2., 2., 2., 4.];
+        let right = [1., 1., 1., 4.];
+        assert_eq!(pixels, [left, right, left, right]);
+    }
+}
+
+#[test]
+fn an_earlier_vm_cannot_be_replaced_by_the_exec_of_done() {
+    let words = [
+        0x7d84_0080,
+        0xbe8a_3c6a,
+        0xf800_101f,
+        0x0101_0101, // mrt1 avec VM sous EXEC réduit
+        0xbefe_030a,
+        0xf800_080f,
+        0x0101_0101, // mrt0 done après restauration
+        S_ENDPGM,
+    ];
+    assert!(matches!(
+        pixel(&words, PERSP_CENTER),
+        Err(ShaderError::Unsupported {
+            what: "a pixel export with a valid mask before done without a valid mask",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn sgpr_and_unpaired_halves_preserve_other_rows_interpolation() {
+    // Deux paires complètes : attr0 au centre, attr1 au centroïde.
+    let pairs = [0xc810_0000, 0xc811_0001, 0xc814_0402, 0xc815_0403];
+    let [exp, _] = exp_mrt0(0);
+    for (extra, bary) in [
+        (vec![0x7e0c_0208], false), // v6 = s8, temporaire à l'entrée
+        (vec![0xc819_0801], true),  // p2 seul, attr2.x
+        (vec![0xc818_0800], true),  // p1 seul, attr2.x
+    ] {
+        let words = [pairs.as_slice(), &extra, &[exp, 0x0606_0504, S_ENDPGM]].concat();
+        let mut n = native_pixel(&words, PERSP_CENTER | PERSP_CENTROID, 0);
+        let StageIo::Ps { inputs, .. } = &mut n.io else {
+            unreachable!()
+        };
+        for row in [1, 2] {
+            inputs.push(PsInput {
+                attr: row,
+                row,
+                ..inputs[0]
+            });
+        }
+        let ps = emit_pixel(&n).unwrap();
+        assert_eq!(parts(&ps).1.iter().any(|e| e.kind == 28), bary);
+        assert_eq!(texcoord_mode(&ps, 0), 2);
+        assert_eq!(texcoord_mode(&ps, 1), 3);
+        validate(&ps);
+    }
 }
 
 /// The ordered section writes through a heap UAV. Without the collision
@@ -451,7 +586,49 @@ fn a_mask_on_a_skipped_pixel_data_edge_is_dead_only_behind_its_flag() {
     assert!(matches!(
         emit_pixel(&n),
         Err(ShaderError::Unsupported {
-            what: "a lane mask read as data",
+            what: "a hardware SGPR input",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn a_descriptor_on_a_skipped_pixel_data_edge_needs_no_host_value() {
+    use crate::native::{RootParam, RootType};
+    let words = [
+        0xbe81_0380, // s_mov_b32 s1, 0 (poids fort de la table)
+        0xbf06_8008, // s_cmp_eq_u32 s8, 0 (temporaire à l’entrée)
+        0xbf84_0004, // s_cbranch_scc0 vers les données
+        0xf408_0100,
+        0xfa00_0520, // s_load_dwordx4 s[4:7], s[0:1], 0x520
+        0x7e04_0280, // v_mov_b32 v2, 0 (branche du descripteur)
+        0xbf82_0002,
+        0xbe87_0387, // s_mov_b32 s7, 7 (branche des données)
+        0x7e04_02c1, // v_mov_b32 v2, -1
+        0x7d84_04c1, // v_cmp_eq_u32 vcc, -1, v2
+        0x8aea_6a7e, // s_andn2_b64 vcc, exec, vcc
+        0xbf87_0001, // sauter la lecture sur la branche du descripteur
+        0x7e06_0207, // v_mov_b32 v3, s7
+        0xf800_180f,
+        0x0303_0303,
+        S_ENDPGM,
+    ];
+    let mut n = native_pixel(&words, PERSP_CENTER, 2);
+    n.wave64 = true;
+    n.layout.push(RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    });
+    validate(&emit_pixel(&n).unwrap());
+    n.code[5 * 4..6 * 4].copy_from_slice(&0x7e04_02c1u32.to_le_bytes());
+    assert!(matches!(
+        emit_pixel(&n),
+        Err(ShaderError::Unsupported {
+            what: "a hardware SGPR input",
             ..
         })
     ));

@@ -7,11 +7,18 @@
 //! sees. A Series S session then dropped some 970 draws a frame "being
 //! made" while its world loaded (run `20261125-022031`).
 //!
-//! - What is kept: each title pipeline with a graphics state that a
-//!   pipeline worker made or tried to make (a first draw with it, or a start
-//!   at creation from the early list), whatever became of it: its shaders'
-//!   containers and the subobjects of the title's stream as the title gave
-//!   them, in its order. A subobject without a pointer is kept byte for
+//! - What is kept: each title pipeline with a graphics state that the title
+//!   creates, at its creation, whether it is ever drawn with or not: its
+//!   shaders' containers and the subobjects of the title's stream as the
+//!   title gave them, in its order. The title creates its pipelines while it
+//!   loads, long before it draws with them, so a session that reaches the
+//!   world keeps those of the whole game, not only those its frames drew
+//!   with ([`created`]). The title's thread only hands the description over
+//!   (its shaders are shared by content, as its pipeline shares them); a
+//!   thread of ours keeps it. With `XTP_KEEP_CREATED=0`, a description is
+//!   kept only once a pipeline worker made or tried to make the pipeline (a
+//!   first draw with it, or a start at creation from the early list), as
+//!   before. A subobject without a pointer is kept byte for
 //!   byte, the input layout with its semantic names; the root signature is
 //!   ours (the translations' bindings define it) and the cached blob is the
 //!   driver's. A stream that cannot be kept whole is not kept at all: one
@@ -34,7 +41,7 @@
 //! - The file, [`FILE`]: versioned ([`MAGIC`]) and append-only, a list of
 //!   entries: a container, by its BLAKE3, or a pipeline, by its key, each
 //!   once. An entry is written whole by one call and carries its length and
-//!   the start of its digest. Workers write it, never the title's threads,
+//!   the start of its digest. Our threads write it, never the title's,
 //!   with the file locked against other processes for each write, at its
 //!   end as it is then: a session first takes in what another one appended
 //!   meanwhile. An entry that does not read back (its digest) is skipped,
@@ -67,7 +74,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::{
@@ -162,6 +169,25 @@ fn as_is(kind: u32) -> bool {
     matches!(kind, 8..=11 | 13..=18 | 20 | 21)
 }
 
+/// Whether byte `i` of the data (after its type) of a subobject of `kind`
+/// kept byte for byte is padding: the title leaves whatever was there,
+/// which would make one state two descriptions (a session to the world
+/// created 14,784 descriptions
+/// that the one before had kept with other padding in their blend and
+/// depth-stencil, 2026-11-25), so it is kept as zeros. Blend (8): three
+/// bytes after each target's write mask, four at the end; depth-stencil
+/// (11, 21): two after the stencil masks, and four at the end of the
+/// second; sample description (17): four at the end.
+fn padding(kind: u32, i: usize) -> bool {
+    match kind {
+        8 => i >= 328 || (i >= 8 && (i - 8) % 40 >= 37),
+        11 => (18..20).contains(&i),
+        21 => (18..20).contains(&i) || (56..60).contains(&i),
+        17 => (8..12).contains(&i),
+        _ => false,
+    }
+}
+
 /// The graphics subobjects of a title's pipeline stream, as kept: each its
 /// type (u8), its length (u16) and its data, in the stream's order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +200,10 @@ pub(crate) struct Capture {
     bytes: Vec<u8>,
     /// No subobject was left out (the stream is kept only then).
     whole: bool,
+    /// Its shaders, shared by content as the title's pipeline shares them
+    /// (`super::shader`), to keep the description at creation
+    /// ([`created`]); none when descriptions are kept once made.
+    shaders: Vec<Arc<Shader>>,
 }
 
 impl Capture {
@@ -259,12 +289,26 @@ impl Capture {
             _ if as_is(kind) && size > 4 => {
                 // SAFETY: the subobject's data follows its type, `size` in
                 // all.
-                let data = unsafe { std::slice::from_raw_parts(at.add(4), size - 4) };
-                self.push(kind, data);
+                let mut data = unsafe { std::slice::from_raw_parts(at.add(4), size - 4) }.to_vec();
+                for (i, byte) in data.iter_mut().enumerate() {
+                    if padding(kind, i) {
+                        *byte = 0;
+                    }
+                }
+                self.push(kind, &data);
             }
-            // The root signature (ours), the shaders (kept apart), the
-            // cached blob (the driver's).
-            _ => {}
+            // The shaders: kept apart, by their containers.
+            _ => {
+                if let Some((_, Some(stage))) = super::subobject(kind)
+                    && at_creation()
+                {
+                    // SAFETY: a shader subobject holds its bytecode at +8.
+                    let code = unsafe { at.add(8).cast::<super::Bytecode>().read_unaligned() };
+                    self.shaders.extend(super::copy(stage, &code));
+                }
+                // The root signature (ours), the cached blob (the
+                // driver's): not kept.
+            }
         }
     }
 
@@ -284,13 +328,27 @@ impl Capture {
         self.bytes.extend(data);
     }
 
-    /// The stream as kept; `None` if a subobject could not be kept.
+    /// The stream as kept; `None` if a subobject could not be kept. At the
+    /// title's creation call: the description is handed over to be kept
+    /// ([`created`]).
     pub(crate) fn finish(self) -> Option<Stream> {
-        self.whole.then(|| Stream(self.bytes.into_boxed_slice()))
+        let Capture {
+            bytes,
+            whole,
+            shaders,
+        } = self;
+        let stream = whole.then(|| Stream(bytes.into_boxed_slice()));
+        created(shaders, stream.as_ref());
+        stream
     }
 }
 
 impl Stream {
+    /// The stream as kept.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+
     /// The graphics state the stream describes: each subobject given to
     /// `GraphicsState::read` again, in the stream's order, as the title's
     /// creation call gave it; `None` if one does not decode.
@@ -839,8 +897,12 @@ fn listed(shaders: &[Arc<Shader>]) -> Option<Listed> {
 
 /// A title pipeline of `shaders` with the graphics state `stream` was
 /// made, or tried: its description is kept unless it is already, with
-/// those of its shaders' containers that are not.
+/// those of its shaders' containers that are not. Nothing to do when
+/// descriptions are kept at creation ([`created`]): this one was.
 pub(crate) fn made(shaders: &[Arc<Shader>], stream: &Stream) {
+    if at_creation() && keeper().is_some() {
+        return;
+    }
     // Hashed outside the lock: a container takes up to some 100 KiB.
     let Some(listed) = listed(shaders) else {
         return;
@@ -849,6 +911,190 @@ pub(crate) fn made(shaders: &[Arc<Shader>], stream: &Stream) {
     let key = key_of(&body);
     if with_writer(|w| w.keep(key, shaders, &listed, &body)) == Some(Keep::Written) {
         KEPT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether descriptions are kept at the title's creation of a pipeline
+/// (`XTP_KEEP_CREATED`, unless `0`), or once a worker made it.
+fn at_creation() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XTP_KEEP_CREATED").map_or(true, |v| v.trim() != "0");
+        if !on {
+            tracing::info!(
+                "recorded pipelines: kept once made, not at creation (XTP_KEEP_CREATED=0)"
+            );
+        }
+        on
+    })
+}
+
+/// Title pipelines with a graphics state created since the start
+/// ([`created`]), and of them those whose stream could not be kept whole.
+static CREATED: AtomicU64 = AtomicU64::new(0);
+static UNKEPT: AtomicU64 = AtomicU64::new(0);
+/// The distinct descriptions among those created, as [`Keeper`] tells
+/// them apart.
+static DISTINCT: AtomicU64 = AtomicU64::new(0);
+
+/// What the title created since the start (for the library's line):
+/// pipelines with a graphics state, those not kept whole, and the distinct
+/// descriptions among the others.
+pub(crate) fn created_counts() -> (u64, u64, u64) {
+    (
+        CREATED.load(Ordering::Relaxed),
+        UNKEPT.load(Ordering::Relaxed),
+        DISTINCT.load(Ordering::Relaxed),
+    )
+}
+
+/// A description the title created, on its way to the file.
+struct Created {
+    shaders: Vec<Arc<Shader>>,
+    stream: Stream,
+}
+
+/// At the title's creation of a pipeline of `shaders` with the graphics
+/// state `stream` (`None`: not kept whole): counted, and handed to the
+/// thread that keeps descriptions ([`keeper`]), unless it is a compute
+/// pipeline (the precook makes those from the pack). The title's thread
+/// does nothing else.
+fn created(shaders: Vec<Arc<Shader>>, stream: Option<&Stream>) {
+    if shaders.is_empty() || matches!(&*shaders, [cs] if cs.stage == "compute") {
+        return;
+    }
+    CREATED.fetch_add(1, Ordering::Relaxed);
+    let Some(stream) = stream else {
+        UNKEPT.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    if let Some(keeper) = keeper() {
+        let _ = keeper.send(Created {
+            shaders,
+            stream: stream.clone(),
+        });
+    }
+}
+
+/// The thread that keeps the descriptions the title creates, started on
+/// first use; `None` if it could not be started (descriptions are then kept
+/// once made, as with `XTP_KEEP_CREATED=0`).
+fn keeper() -> Option<&'static mpsc::Sender<Created>> {
+    static SENDER: OnceLock<Option<mpsc::Sender<Created>>> = OnceLock::new();
+    SENDER
+        .get_or_init(|| {
+            let (send, receive) = mpsc::channel();
+            let started = std::thread::Builder::new()
+                .name("xtp-record".into())
+                .spawn(move || keep_created(&receive));
+            match started {
+                Ok(_) => Some(send),
+                Err(e) => {
+                    tracing::warn!(error = %e, "recorded pipelines: no thread to keep them at creation");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// How often the keeper says how far the title's creations are, while they
+/// go on, and how long without one it takes for them to have stopped.
+const SAY_EVERY: Duration = Duration::from_secs(10);
+const QUIET: Duration = Duration::from_secs(5);
+
+/// The keeper's loop: each description received kept once ([`Keeper`]),
+/// and how many the title created said every [`SAY_EVERY`] while it
+/// creates them and once it stops ([`QUIET`]).
+fn keep_created(receive: &mpsc::Receiver<Created>) {
+    let mut keeper = Keeper::default();
+    let mut first: Option<Instant> = None;
+    let mut said = Instant::now();
+    let mut new = false;
+    let say = |keeper: &Keeper, first: Option<Instant>, why: &str| {
+        let (created, unkept, distinct) = created_counts();
+        tracing::info!(
+            created,
+            unkept,
+            distinct,
+            repeated = keeper.repeated,
+            kept = KEPT.load(Ordering::Relaxed),
+            frame = crate::frame::current(),
+            seconds = first.map_or(0.0, |t| t.elapsed().as_secs_f64()),
+            "title pipelines created ({why})"
+        );
+    };
+    loop {
+        match receive.recv_timeout(QUIET) {
+            Ok(c) => {
+                first.get_or_insert_with(Instant::now);
+                new = true;
+                keeper.take(c, |key, shaders, listed, body| {
+                    with_writer(|w| w.keep(key, shaders, listed, body))
+                });
+                if said.elapsed() >= SAY_EVERY {
+                    say(&keeper, first, "so far");
+                    said = Instant::now();
+                    new = false;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if new {
+                    say(&keeper, first, "none for 5 s");
+                    said = Instant::now();
+                    new = false;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// What the keeper knows: each shader's container BLAKE3, by the shared
+/// shader (hashed once, not once per pipeline), and the descriptions it
+/// took already.
+#[derive(Default)]
+struct Keeper {
+    hashes: HashMap<usize, (Arc<Shader>, [u8; 32])>,
+    seen: HashSet<[u8; 16]>,
+    /// Descriptions created again (the same shaders and stream).
+    repeated: u64,
+}
+
+impl Keeper {
+    /// Takes in a created description: counted once among the distinct
+    /// ones, and kept by `keep` (key, shaders, listed, body) the first
+    /// time.
+    fn take(
+        &mut self,
+        c: Created,
+        keep: impl FnOnce([u8; 16], &[Arc<Shader>], &[(u8, [u8; 32])], &[u8]) -> Option<Keep>,
+    ) {
+        let listed = c
+            .shaders
+            .iter()
+            .map(|s| {
+                let stage = STAGES.iter().position(|&n| n == s.stage)? as u8;
+                let (_, hash) = self
+                    .hashes
+                    .entry(Arc::as_ptr(s) as usize)
+                    .or_insert_with(|| (s.clone(), *blake3::hash(&s.container).as_bytes()));
+                Some((stage, *hash))
+            })
+            .collect::<Option<Listed>>();
+        let Some(listed) = listed else {
+            return;
+        };
+        let body = body(&listed, &c.stream.0);
+        let key = key_of(&body);
+        if !self.seen.insert(key) {
+            self.repeated += 1;
+            return;
+        }
+        DISTINCT.fetch_add(1, Ordering::Relaxed);
+        if keep(key, &c.shaders, &listed, &body) == Some(Keep::Written) {
+            KEPT.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1592,6 +1838,79 @@ mod tests {
                 .iter()
                 .all(|(_, h)| read.container(h).is_some())
         );
+    }
+
+    /// Two streams that differ only in the padding of their blend and
+    /// depth-stencil are kept as one.
+    #[test]
+    fn padding_is_kept_as_zeros() {
+        let a = title_stream(18);
+        let mut b = title_stream(18);
+        // The padding after target 6's write mask, and the depth-stencil's.
+        b.bytes[0x88 + 4 + 8 + 40 * 6 + 37] = 0x5a;
+        b.bytes[0x214 + 18] = 0x77;
+        assert_ne!(a.bytes, b.bytes);
+        let (sa, sb) = (kept_stream(&a), kept_stream(&b));
+        assert_eq!(sa, sb);
+        assert_eq!(
+            sa.state().unwrap().describe(),
+            create(&a).host.graphics.as_deref().unwrap().describe()
+        );
+    }
+
+    /// At creation, a stream's shaders are taken in as the title's pipeline
+    /// shares them (the same shared containers), in the stream's order.
+    #[test]
+    fn a_streams_shaders_are_taken_in_at_creation() {
+        let title = title_stream(15);
+        let p = create(&title);
+        let mut c = Capture::new();
+        for at in [0x10, 0x28, 0x40] {
+            // SAFETY: the vertex, pixel and (empty) domain subobjects of a
+            // live stream.
+            unsafe { c.take(title.bytes[at] as u32, title.bytes.as_ptr().add(at), 24) };
+        }
+        assert_eq!(c.shaders.len(), 2, "no domain shader");
+        assert!(
+            c.shaders
+                .iter()
+                .zip(&p.shaders)
+                .all(|(a, b)| Arc::ptr_eq(a, b))
+        );
+        assert_eq!(c.shaders[0].stage, "vertex");
+    }
+
+    /// The keeper keeps each description the title creates once, however
+    /// often it is created, and hashes each shared container once.
+    #[test]
+    fn the_keeper_keeps_each_created_description_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Writer::open(&dir.path().join(FILE)).unwrap();
+        let stream = kept_stream(&title_stream(16));
+        let other = kept_stream(&title_stream(17));
+        let vs = shader("vertex", b"created vs");
+        let ps = shader("pixel", b"created ps");
+        let mut keeper = Keeper::default();
+        let mut kept = Vec::new();
+        for s in [&stream, &stream, &other, &stream] {
+            let c = Created {
+                shaders: vec![vs.clone(), ps.clone()],
+                stream: s.clone(),
+            };
+            keeper.take(c, |key, shaders, listed, body| {
+                let done = w.keep(key, shaders, listed, body).unwrap();
+                kept.push(done);
+                Some(done)
+            });
+        }
+        assert_eq!(kept, [Keep::Written, Keep::Written], "each once");
+        assert_eq!((keeper.repeated, keeper.seen.len()), (2, 2));
+        assert_eq!(keeper.hashes.len(), 2, "each container hashed once");
+        let read = super::read(dir.path()).unwrap();
+        assert_eq!((read.pipelines.len(), read.containers.len()), (2, 2));
+        assert_eq!(read.pipelines[1].stream, other);
+        // Kept as a worker keeps it after making it: the same key.
+        assert_eq!(keep(&mut w, &[vs, ps], &stream), Keep::Held);
     }
 
     /// A rewrite keeps each description that reads back once, newest first

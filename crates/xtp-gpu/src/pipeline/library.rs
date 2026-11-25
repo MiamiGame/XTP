@@ -11,9 +11,10 @@
 //!    known when the title creates them (their shader containers and
 //!    graphics state); the next run hands those to the workers at
 //!    creation, during loading.
-//! 3. Beside them, the graphics and mesh pipelines' whole descriptions
-//!    ([`super::record`]), from which `xtp precook` makes them into the
-//!    library again after a translator change.
+//! 3. Beside them, the whole descriptions of the graphics and mesh
+//!    pipelines the title creates ([`super::record`]), from which `xtp
+//!    precook` makes them into the library: those of the whole game after
+//!    one session, and again after a translator change.
 //!
 //! Loads and stores of different pipelines run side by side: the library
 //! is thread-safe and synchronises itself, but for two loads of the same
@@ -375,6 +376,7 @@ pub(crate) fn save(now: bool) -> Saved {
             }
             return Err(e);
         }
+        let (created, unkept, distinct) = super::record::created_counts();
         tracing::info!(
             library = bytes.is_some(),
             bytes = bytes.unwrap_or(0),
@@ -382,6 +384,9 @@ pub(crate) fn save(now: bool) -> Saved {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            created,
+            created_unkept = unkept,
+            created_distinct = distinct,
             recorded = super::record::kept(),
             lock_wait_ms = LOCK_US.load(Ordering::Relaxed) / 1000,
             load_ms = LOAD_US.load(Ordering::Relaxed) / 1000,

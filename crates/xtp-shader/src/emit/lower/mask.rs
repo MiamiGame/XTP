@@ -62,6 +62,17 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
 }
 
 impl<'a> Lower<'a> {
+    /// Le masque initial d'EXEC dépend de la taille de la queue. Un mot de
+    /// masque construit comme donnée peut aussi contenir des lanes hors EXEC.
+    pub(super) fn active_mask(&mut self, v: Value, mask: Bool, at: usize) -> Result<V, Why> {
+        let bit = self.boolean(mask, at)?;
+        Ok(if self.x.st.active.contains(&v) {
+            self.with_partial(at, bit)
+        } else {
+            bit
+        })
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     pub(super) fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -89,7 +100,7 @@ impl<'a> Lower<'a> {
                 Some(&b) if b == self.cur_ir => self.cur,
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
-            let bit = self.boolean(m, at)?;
+            let bit = self.active_mask(lo, m, at)?;
             let xy = self.console_ballot(at, bit);
             self.ballots.insert(lo, xy);
             return Ok(if high { xy.1 } else { xy.0 });
@@ -121,7 +132,7 @@ impl<'a> Lower<'a> {
                 }
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
-                let bit = bit?;
+                let bit = self.with_partial(at, bit?);
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self

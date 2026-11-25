@@ -363,6 +363,11 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
+            #[cfg(windows)]
+            crate::HleExport {
+                name: "VirtualProtect",
+                address: xtp_gpu::title_virtual_protect as *const () as usize,
+            },
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
             hle_export!(GetModuleFileNameW),

@@ -688,20 +688,9 @@ mod tests {
         );
     }
 
-    fn check_rectangle_bounds(test: &str, depth_test: bool) {
-        use crate::object::{This, slot};
-        use crate::pipeline::{host::HostPipeline, test_shader};
-        use crate::resource::tests_support::{committed, depth_unordered};
+    fn rectangle_shaders(cases: &[Case]) -> [Arc<crate::pipeline::Shader>; 2] {
+        use crate::pipeline::test_shader;
         use xtp_shader::{HwStage, emit::HostShader};
-        let Some(gpu) = crate::testgpu::device(test) else {
-            return;
-        };
-        let host = gpu.host();
-        if !host.depth_bounds {
-            crate::testgpu::skip(test, "depth bounds unsupported");
-            return;
-        }
-        let cases = rectangles();
         let stage = |stage, dxil| HostShader {
             stage,
             dxil,
@@ -711,19 +700,91 @@ mod tests {
             static_samplers: vec![],
             root_cbvs: vec![],
             root_srvs: vec![],
+            root_uavs: vec![],
             stride_table: false,
             run_time_buffers: 0,
         };
-        let shaders = [
-            test_shader("vertex", stage(HwStage::Vs, vertex_shader(&cases, None))),
+        [
+            test_shader("vertex", stage(HwStage::Vs, vertex_shader(cases, None))),
             test_shader("pixel", stage(HwStage::Ps, probe::pixel())),
-        ];
+        ]
+    }
+
+    #[test]
+    fn indexed_vertex_ids_select_the_rectangle_and_its_fourth_corner() {
+        use crate::object::{This, slot};
+        use crate::pipeline::{host_pipeline, test_graphics_pipeline};
+        let Some(gpu) = crate::testgpu::device(
+            "rectangles::geometry::tests::indexed_vertex_ids_select_the_rectangle_and_its_fourth_corner",
+        ) else {
+            return;
+        };
+        let cases = rectangles();
+        let mut state = crate::pipeline::host::GraphicsState::default();
+        state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(19);
+        state.targets.NumRenderTargets = 1;
+        state.targets.RTFormats[0] = FORMAT;
+        // Même rasterisation sans élimination de faces que les autres sondes.
+        #[repr(C)]
+        struct Raster(u32, D3D12_RASTERIZER_DESC);
+        let raster = Raster(
+            10,
+            D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+        );
+        // SAFETY: sous-objet de rasterisation complet.
+        unsafe { state.read(10, (&raw const raster).cast()) };
+        let title = test_graphics_pipeline(rectangle_shaders(&cases).into(), state, &[0]);
+        let pso = host_pipeline(title).expect("pipeline de rectangles");
+        let target = Target::new(&gpu.host().device, 1);
+        let list = TitleList::new();
+        crate::testgpu::bind_indexed_heaps(gpu.host(), list.host());
+        target.bind(list.host(), &pso.root, &pso.pso);
+        let indices = TitleBuffer::new(16);
+        indices.set_words(|i| [0, 6, 7, 8][i]);
+        let view = crate::draw::IndexView {
+            address: indices.address(),
+            size: 16,
+            format: 42,
+        };
+        let t = list.this();
+        slot::<extern "system" fn(This, This)>(t, 0xc8)(t, title);
+        slot::<extern "system" fn(This, u32)>(t, 0xa0)(t, 17);
+        slot::<extern "system" fn(This, *const crate::draw::IndexView)>(t, 0x178)(t, &view);
+        slot::<extern "system" fn(This, u32, u32, u32, i32, u32)>(t, 0x68)(t, 3, 1, 1, 0, 0);
+        let pixels = target.read(gpu.host(), &list);
+        for (i, pixel) in pixels.iter().enumerate() {
+            let cell = (i as u32 % W) / CELL;
+            assert_eq!(pixel[3], if cell == 2 { flat(2, 0) as f32 } else { 0.0 });
+        }
+        slot::<extern "system" fn(This) -> u32>(title, 0x10)(title);
+    }
+
+    fn check_rectangle_bounds(test: &str, depth_test: bool) {
+        use crate::object::{This, slot};
+        use crate::pipeline::host::HostPipeline;
+        use crate::resource::tests_support::{committed, depth_unordered};
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        if !host.depth_bounds {
+            crate::testgpu::skip(test, "depth bounds unsupported");
+            return;
+        }
+        let cases = rectangles();
+        let shaders = rectangle_shaders(&cases);
         for stored in [None, Some(0.125), Some(0.5)] {
             let state = depth_bounds_state(19, stored.is_some(), stored.is_some() && depth_test);
             let pso = HostPipeline::new(&shaders, Some(&state))
                 .expect("rectangle pipeline with depth bounds");
             let list = TitleList::new();
             let target = Target::new(&host.device, 1);
+            crate::testgpu::bind_indexed_heaps(host, list.host());
             target.bind(list.host(), &pso.root, &pso.pso);
             let depth = stored.map(|z| {
                 let title = committed(&depth_unordered(W.into(), H, 40));
@@ -1480,11 +1541,12 @@ mod tests {
             (
                 crate::rectangles::Records::Title(&args_copy, args.address()),
                 16,
-                1,
+                0..1,
             ),
             None,
             None,
             None,
+            &mut Default::default(),
         )
         .expect("expanded");
         target.bind(list.host(), &root, &pso);

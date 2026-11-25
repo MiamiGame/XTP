@@ -1,7 +1,7 @@
 //! Vérifie le trajet complet des identifiants GFX10 sur le GPU de test.
 
 use super::HostPipeline;
-use crate::indirect::{self, Expanded};
+use crate::indirect;
 use crate::pipeline::{Shader, Translated};
 use std::sync::{Arc, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -60,7 +60,7 @@ fn every_group_runs_once_with_its_guest_id() {
         return;
     };
     let host = gpu.host();
-    for (axis, n) in [(0, 70000u32), (1, 65536), (2, (1 << 20) + 1)] {
+    for (axis, n) in [(0, 1000u32), (0, 70000), (1, 65536), (2, (1 << 20) + 1)] {
         let p = counting(axis);
         let base = p
             .group_base()
@@ -109,16 +109,18 @@ fn every_group_runs_once_with_its_guest_id() {
                     views.GetCPUDescriptorHandleForHeapStart(),
                 );
                 if indirect {
-                    let scratch = Expanded::reserve(&mut held, &list, 1).unwrap();
-                    assert!(indirect::rewrite(
-                        &list,
-                        args.GetGPUVirtualAddress(),
-                        (2, 12, 1),
-                        None,
-                        Some(scratch),
-                        None
-                    ));
-                    indirect::ready(&list, &scratch.buffer);
+                    held = Some(
+                        indirect::bound(
+                            &list,
+                            (&args, 0),
+                            (2, 12, 1),
+                            None,
+                            None,
+                            Default::default(),
+                            indirect::Output::NativePrefix,
+                        )
+                        .unwrap(),
+                    );
                 }
                 let l = &list.list;
                 l.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
@@ -128,13 +130,23 @@ fn every_group_runs_once_with_its_guest_id() {
                 if let Some(scratch) = held.as_ref() {
                     let sig = indirect::signature(2, &p.root, Some(base)).unwrap();
                     list.keep(&sig);
+                    let native = crate::draw::host_signature(2, 12).unwrap();
+                    let offset = scratch.native_offset.unwrap();
+                    l.ExecuteIndirect(
+                        &native,
+                        1,
+                        &scratch.buffer,
+                        offset + 4,
+                        &scratch.buffer,
+                        offset,
+                    );
                     l.ExecuteIndirect(
                         &sig,
                         scratch.capacity,
                         &scratch.buffer,
-                        4,
+                        scratch.offset + 4,
                         &scratch.buffer,
-                        0,
+                        scratch.offset,
                     );
                 } else {
                     indirect::direct(&list, dims, Some(base), false, |[x, y, z]| {

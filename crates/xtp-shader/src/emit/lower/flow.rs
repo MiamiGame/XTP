@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::{Lower, Stop, Val, Why, unsupported};
 use crate::emit::bitcode::{Attr, Bin, Rmw, Term, V, pred};
-use crate::gfx10::{Fields, NULL, Operand};
+use crate::gfx10::{Encoding, Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
@@ -1090,6 +1090,11 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            // Where the program reads the joined value, an edge whose value
+            // has no DXIL form brings an undefined one only if no lane that
+            // takes it reads the register before writing it again
+            // (`unread_on_edge`). A join nothing reads takes any value.
+            let read = self.read_phis.contains(&phi.value);
             // A join of computed numbers (`dead_at_join`): an SGPR, not a
             // mask itself, some of whose incoming values are numbers and
             // none a constant.
@@ -1111,7 +1116,16 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
-                    let _ = self.lazy_barycentric(arg);
+                    // Une constante déportée peut servir uniquement sur cette
+                    // arête. Sa lecture à l'entrée domine tous les prédécesseurs.
+                    if !self.x.res.spill_loads.is_empty()
+                        && let Some(&(param, dword)) = self.params.get(&arg)
+                    {
+                        let val = self.user(param, dword);
+                        self.vals.insert(arg, val);
+                    } else {
+                        let _ = self.lazy_barycentric(arg);
+                    }
                 }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
@@ -1122,25 +1136,42 @@ impl<'a> Lower<'a> {
                     // data: the registers are reused after the descriptor's
                     // last access, so the program reads the joined value
                     // only after the data edge (the console compiler's phi
-                    // of a value defined on one edge only). Only dwords
+                    // of a value defined on one edge only). Undefined on
+                    // the descriptor's edge where no lane that takes it
+                    // reads the register (`unread_on_edge`); a read there
+                    // stops the program, as a direct read does. Only dwords
                     // that have no host value (addresses, formats): any
                     // other reason the descriptor load stopped with (a cube
                     // or MSAA image, a constant buffer's descriptor read as
                     // data) stops the program as it would without the join.
-                    // shortcut: undefined on the descriptor edge; wrong if
-                    // the program read the descriptor's dwords as data there.
+                    // shortcut: in the console flow (branches taken
+                    // wave-wide) the proof follows every path, as no
+                    // condition says which way the wave goes, so a dword
+                    // that the program reads only behind a flag still fails
+                    // it there; such a join keeps the undefined value
+                    // unproven, as before the proof, and counts in
+                    // `emit::UNPROVEN_DESCRIPTOR_JOINS`. The 12 ray-tracing
+                    // resolve compute programs of the characters
+                    // (`CS_RaytracingResolve` f21e9178, 842de0c32bc8dcc5 and
+                    // its family) run so. Wrong if the program reads the
+                    // descriptor's dwords as data on that edge.
                     (Some(Val::Missing(why)), false)
-                        if why == super::smem::DESCRIPTOR_WORD && self.descriptor_dword(arg) =>
+                        if why == super::smem::DESCRIPTOR_WORD
+                            && self.descriptor_dword(arg)
+                            && (!read
+                                || self.unread_on_edge(phi.reg, q, b)
+                                || self.console_cf && unproven_join()) =>
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
-                    (Some(Val::Missing(super::mask::LANE_MASK)), false)
-                        if self.unused_pixel_sgpr(phi.reg, q, b) =>
-                    {
-                        self.s.m.i32(0)
-                    }
+                    (
+                        Some(Val::Missing(super::mask::LANE_MASK | super::smem::ONLY_DATA)),
+                        false,
+                    ) if self.unused_pixel_sgpr(phi.reg, q, b) => self.s.m.i32(0),
                     (Some(Val::Missing(_)), false)
-                        if numbers && self.dead_at_join(arg, &mut Vec::new()) =>
+                        if numbers
+                            && self.dead_at_join(arg, &mut Vec::new())
+                            && (!read || self.unread_on_edge(phi.reg, q, b)) =>
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
@@ -1195,34 +1226,34 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Whether `v`, an incoming value of a join of computed numbers, is a
-    /// register the program reads as no number there: a descriptor's dword
-    /// with no host value ([`super::smem::DESCRIPTOR_WORD`]), a lane mask's
-    /// dword outside compute (where no ballot gives it as data), or a join
-    /// of only such values. Compiled code joins numbers with numbers: a
-    /// physical register that holds a mask on one path and a number on the
-    /// other holds two variables, and the program reads the joined value
-    /// only where the number's path set it (behind a flag kept in a VGPR:
-    /// the skinned and shadow mesh programs 235e56869c1ea883 at 0x1980,
-    /// c3ba22ec6fc5dd4a at 0x1b48). That edge brings an undefined value.
-    // shortcut: wrong where a mask meets a computed number and the program
-    // reads the mask's side as data after the join (in compute, where
-    // ballots are exact, such a join stays refused, as does one with a
-    // constant: `cond ? ballot : 5`).
+    /// Whether `v`, an incoming value of a join of computed numbers, is of
+    /// a kind compiled code holds in a register it then reuses for a
+    /// number: a descriptor's dword with no host value
+    /// ([`super::smem::DESCRIPTOR_WORD`], in every stage, as the rule for a
+    /// descriptor's dword joined directly), a lane mask's dword outside
+    /// compute (where no ballot gives it as data), or a join of only such
+    /// values. A physical register that holds a mask on one path and a
+    /// number on the other holds two variables, and the program reads the
+    /// joined value only where the number's path set it: behind a flag kept
+    /// in a VGPR, 0 on the mask's edge (the skinned and shadow mesh programs
+    /// 235e56869c1ea883 at 0x1980, c3ba22ec6fc5dd4a at 0x1b48). The join
+    /// takes an undefined value on that edge only where
+    /// [`Self::unread_on_edge`] proves it: a program that reads the mask's
+    /// side after the join stops, as a direct read does. In compute
+    /// (ballots are exact) such a join stays refused, as does one with a
+    /// constant (`cond ? ballot : 5`).
     // Ported from fxceless's VIctory fork (commit 578d459) by fxceless
     // (`dead` and its arm in the joins). Here: undefined rather than 0, as
-    // the descriptor-word rule above; not in compute; not where a number of
-    // the join is a constant.
+    // the descriptor-word rule above; only where no lane on the edge reads
+    // the register; not for masks in compute; not where a number of the
+    // join is a constant.
     fn dead_at_join(&self, v: Value, seen: &mut Vec<Value>) -> bool {
-        if matches!(self.vals.get(&v), Some(Val::Missing(w)) if *w == super::smem::DESCRIPTOR_WORD)
-            && self.descriptor_dword(v)
-        {
-            return true;
-        }
         let st = self.x.st;
-        if self.mask_data != super::mask::MaskData::Console
-            && (st.masks.contains_key(&v) || st.highs.contains_key(&v))
-        {
+        let word = matches!(self.vals.get(&v), Some(Val::Missing(w)) if *w == super::smem::DESCRIPTOR_WORD)
+            && self.descriptor_dword(v);
+        let mask = self.mask_data != super::mask::MaskData::Console
+            && (st.masks.contains_key(&v) || st.highs.contains_key(&v));
+        if word || mask {
             return true;
         }
         let Some(&(b, i)) = self.phi_at.get(&v) else {
@@ -1237,6 +1268,563 @@ impl<'a> Lower<'a> {
             .iter()
             .all(|&a| self.dead_at_join(a, seen))
     }
+
+    /// Whether no lane that enters join `b` from `pred` makes what `reg`
+    /// held on that edge matter: what the register held there is then no
+    /// value the program uses, and the join may take an undefined one.
+    ///
+    /// Per lane, a path follows only the branches the lane can take with
+    /// what it knows ([`Path`]): what holds on entering `pred` and its
+    /// branch to the join, the branches taken since, the constants the
+    /// join's phis take on that edge (a flag VGPR that is 0 on the mask's
+    /// edge and that the program tests before reading the register), and a
+    /// comparison already decided on the path made again of the same
+    /// values. Vector instructions whose guard cannot hold do not run.
+    ///
+    /// The value may flow into scalar ALU operations: what they write is
+    /// then tainted too, until written again. Taint ends the proof where
+    /// anything else reads it (a vector instruction, memory, a message, an
+    /// EXEC write), and at a branch whose way it can change: one whose
+    /// condition, with what the lane knows, takes both ways and tests a
+    /// tainted atom. The material and character pixel programs
+    /// (f23ac5187c49056a, the `PedTextured` family) test the register at
+    /// the join beside a flag (`flag && word != 0`) whose side alone
+    /// decides the branch on the edge where the word is a descriptor's.
+    ///
+    /// Back at the join (a loop), the lane goes on without the join's
+    /// constants. An indirect jump, or a search of more than
+    /// [`UNREAD_STEPS`] blocks: no proof. In the console flow (branches
+    /// taken wave-wide) every successor is followed, every instruction
+    /// runs, any read ends the proof, and only a scalar instruction's write
+    /// ends a path.
+    fn unread_on_edge(&self, reg: Reg, pred: usize, b: usize) -> bool {
+        let (p, st) = (self.x.p, self.x.st);
+        let per_lane = !self.console_cf;
+        let Some(n) = p.blocks[b].preds.iter().position(|&q| q == pred) else {
+            return false;
+        };
+        let joined: HashMap<Value, u32> = p.blocks[b]
+            .phis
+            .iter()
+            .filter_map(|phi| Some((phi.value, self.word_of(phi.args[n])?)))
+            .collect();
+        let none = HashMap::new();
+        // What lanes entering `pred` know, and its branch to the join.
+        // Over a back edge it holds for the iteration that ends.
+        let mut start = Taint {
+            known: Vec::new(),
+            regs: vec![reg],
+            values: Vec::new(),
+            fresh: true,
+        };
+        if per_lane && self.rpo[b] > self.rpo[pred] {
+            let entry = Path {
+                joined: &none,
+                at: pred,
+                from: None,
+                known: &[],
+                tainted: &[],
+            };
+            start.known = self.learn(&entry, st.reach[pred], true);
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = st.exits[pred]
+                && taken != not_taken
+            {
+                let more = self.learn(
+                    &Path {
+                        known: &start.known,
+                        ..entry
+                    },
+                    when,
+                    taken == b,
+                );
+                start.known.extend(more);
+            }
+        }
+        // What a lane knows entering each block by each edge, and what is
+        // tainted there, over all the paths found so far: the facts only
+        // shrink and the taint only grows as the search goes on.
+        let mut states: HashMap<(usize, usize), Taint> = HashMap::new();
+        states.insert((pred, b), start);
+        let mut work = vec![(pred, b)];
+        let mut steps = 0;
+        'paths: while let Some((from, at)) = work.pop() {
+            steps += 1;
+            if steps > UNREAD_STEPS {
+                return false;
+            }
+            let mut t = states[&(from, at)].clone();
+            let block = &p.blocks[at];
+            // A phi of the register a path holds tainted is tainted on it
+            // (the join's own was tainted at the start).
+            if let Some(k) = block.preds.iter().position(|&q| q == from) {
+                for phi in &block.phis {
+                    if (t.regs.contains(&phi.reg) || t.values.contains(&phi.args[k]))
+                        && !t.values.contains(&phi.value)
+                    {
+                        t.values.push(phi.value);
+                    }
+                }
+            }
+            let known = t.known.clone();
+            let values = t.values.clone();
+            let path = Path {
+                joined: if t.fresh { &joined } else { &none },
+                at,
+                from: Some(from),
+                known: &known,
+                tainted: &values,
+            };
+            let last = block.insts.len().saturating_sub(1);
+            for (i, inst) in block.insts.iter().enumerate() {
+                let guard = if per_lane { st.guards[at][i] } else { None };
+                let (runs, skips) = guard.map_or((true, false), |g| self.outcomes(g, &path));
+                let scalar = matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. });
+                // A vector instruction writes its SGPRs (a lane read, a
+                // compare's mask) in every lane, whatever its guard
+                // (`write_placed`): they hold its result afterwards. A lane
+                // read's value reaches them even where the guard fails (a
+                // compare's bit is 0 there).
+                let to_sgpr = matches!(inst.fields, Fields::Valu(_))
+                    && inst.writes.iter().any(|w| matches!(w.0, Reg::S(_)));
+                let lane_read = to_sgpr && !inst.name().starts_with("v_cmp");
+                if (runs || per_lane && lane_read)
+                    && inst
+                        .reads
+                        .iter()
+                        .any(|(r, v)| t.regs.contains(r) || t.values.contains(v))
+                {
+                    let writes_exec = inst
+                        .writes
+                        .iter()
+                        .any(|w| matches!(w.0, Reg::S(c) if c == EXEC || c == EXEC + 1));
+                    let branch = i == last
+                        && matches!(inst.fields, Fields::Sopp { .. })
+                        && inst.name().starts_with("s_cbranch_");
+                    if per_lane && branch {
+                        // The block's exit decides with the condition.
+                    } else if per_lane && matches!(inst.fields, Fields::Sop { .. }) && !writes_exec
+                    {
+                        for &(r, v) in &inst.writes {
+                            if !t.regs.contains(&r) {
+                                t.regs.push(r);
+                            }
+                            if !t.values.contains(&v) {
+                                t.values.push(v);
+                            }
+                        }
+                        continue;
+                    } else {
+                        return false;
+                    }
+                }
+                if per_lane && to_sgpr {
+                    t.regs
+                        .retain(|r| !matches!(r, Reg::S(_)) || inst.write(*r).is_none());
+                }
+                if !skips && (per_lane || scalar) {
+                    t.regs.retain(|r| inst.write(*r).is_none());
+                }
+            }
+            if t.regs.is_empty() {
+                continue 'paths;
+            }
+            let values = t.values.clone();
+            let path = Path {
+                tainted: &values,
+                ..path
+            };
+            let next: Vec<(usize, Option<(Bool, bool)>)> = match (st.exits[at], &block.exit) {
+                (_, Exit::Indirect) | (LaneExit::Indirect, _) => return false,
+                (
+                    LaneExit::Branch {
+                        when,
+                        taken,
+                        not_taken,
+                    },
+                    _,
+                ) if per_lane && taken != not_taken => {
+                    let (can, cannot) = self.outcomes(when, &path);
+                    if can && cannot && self.tests_taint(when, &values) {
+                        return false;
+                    }
+                    let mut next = Vec::new();
+                    if can {
+                        next.push((taken, Some((when, true))));
+                    }
+                    if cannot {
+                        next.push((not_taken, Some((when, false))));
+                    }
+                    next
+                }
+                (_, exit) => exit.successors().into_iter().map(|t| (t, None)).collect(),
+            };
+            for (to, branch) in next {
+                let mut next = Taint {
+                    known: Vec::new(),
+                    regs: t.regs.clone(),
+                    values: t.values.clone(),
+                    // Back at the join, its phis are the next iteration's.
+                    fresh: t.fresh && to != b,
+                };
+                // Over a back edge the loop redefines what the lane knew.
+                if self.rpo[to] > self.rpo[at] {
+                    next.known.clone_from(&known);
+                    if let Some((when, holds)) = branch {
+                        let more = self.learn(&path, when, holds);
+                        next.known.extend(more);
+                    }
+                    // Knowing less only adds paths.
+                    let over = next.known.len().saturating_sub(MAX_KNOWN);
+                    next.known.drain(..over);
+                }
+                match states.get_mut(&(at, to)) {
+                    None => {
+                        states.insert((at, to), next);
+                    }
+                    Some(old) => {
+                        if !old.merge(&next) {
+                            continue;
+                        }
+                    }
+                }
+                work.push((at, to));
+            }
+        }
+        true
+    }
+
+    /// Whether `b` tests an atom of a tainted value ([`Self::unread_on_edge`]).
+    fn tests_taint(&self, b: Bool, tainted: &[Value]) -> bool {
+        self.x
+            .st
+            .bools
+            .support(b)
+            .into_iter()
+            .any(|a| atom_of(a).is_some_and(|v| tainted.contains(&v)))
+    }
+
+    /// The atoms that `b` holding as `holds` decides on `path`, which it
+    /// does not know yet (none when `b` tests more than [`MAX_LEARN`]).
+    fn learn(&self, path: &Path, b: Bool, holds: bool) -> Vec<(Atom, bool)> {
+        let atoms = self.x.st.bools.support(b);
+        if atoms.len() > MAX_LEARN {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for atom in atoms {
+            if self.atom_value(atom, path).is_some()
+                || atom_of(atom).is_some_and(|v| path.tainted.contains(&v))
+            {
+                continue;
+            }
+            for value in [false, true] {
+                let mut known = path.known.to_vec();
+                known.push((atom, value));
+                let (t, f) = self.outcomes(
+                    b,
+                    &Path {
+                        known: &known,
+                        ..*path
+                    },
+                );
+                if !(if holds { t } else { f }) {
+                    out.push((atom, !value));
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `b` can hold, and whether it can fail, in a lane on `path`.
+    fn outcomes(&self, b: Bool, path: &Path) -> (bool, bool) {
+        self.outcomes_in(b, path, &mut HashMap::new(), &mut HashMap::new())
+    }
+
+    fn outcomes_in(
+        &self,
+        b: Bool,
+        path: &Path,
+        memo: &mut HashMap<Bool, (bool, bool)>,
+        atoms: &mut HashMap<Atom, Option<bool>>,
+    ) -> (bool, bool) {
+        if b == Bool::TRUE {
+            return (true, false);
+        }
+        if b == Bool::FALSE {
+            return (false, true);
+        }
+        if let Some(&r) = memo.get(&b) {
+            return r;
+        }
+        let Some((atom, low, high)) = self.x.st.bools.node(b) else {
+            return (true, true);
+        };
+        let value = match atoms.get(&atom) {
+            Some(&v) => v,
+            None => {
+                let v = self.atom_value(atom, path);
+                atoms.insert(atom, v);
+                v
+            }
+        };
+        let r = match value {
+            Some(v) => self.outcomes_in(if v { high } else { low }, path, memo, atoms),
+            None => {
+                let (lt, lf) = self.outcomes_in(low, path, memo, atoms);
+                let (ht, hf) = self.outcomes_in(high, path, memo, atoms);
+                (lt || ht, lf || hf)
+            }
+        };
+        memo.insert(b, r);
+        r
+    }
+
+    /// An atom's value in a lane on `path`: known there, a comparison of
+    /// two constants, or the same comparison of the same values as an atom
+    /// known there.
+    fn atom_value(&self, atom: Atom, path: &Path) -> Option<bool> {
+        if atom_of(atom).is_some_and(|v| path.tainted.contains(&v)) {
+            return None;
+        }
+        if let Some(&(_, v)) = path.known.iter().find(|k| k.0 == atom) {
+            return Some(v);
+        }
+        let (rel, ops, negated) = match self.condition(atom, path)? {
+            Cond::Fixed(v) => return Some(v),
+            Cond::Compare(rel, ops, negated) => (rel, ops, negated),
+        };
+        if let [Op::Word(x), Op::Word(y)] = ops {
+            return Some(rel.holds(x, y) != negated);
+        }
+        path.known
+            .iter()
+            .find_map(|&(other, v)| match self.condition(other, path) {
+                Some(Cond::Compare(r, o, n)) if r == rel && o == ops => Some((v != n) != negated),
+                _ => None,
+            })
+    }
+
+    /// A lane's bit of a VALU compare or an SCC of a scalar compare, of
+    /// 32-bit integers with no modifier, as a [`Cond`] of its operands on
+    /// `path`.
+    fn condition(&self, atom: Atom, path: &Path) -> Option<Cond> {
+        let (Atom::Lane(v) | Atom::Uniform(v)) = atom else {
+            return None;
+        };
+        let &cb = self.def_block.get(&v)?;
+        let inst = self.x.p.blocks[cb]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        let name = inst.name();
+        let (rest, ops) = match (&inst.fields, atom) {
+            (Fields::Valu(alu), Atom::Lane(_))
+                if matches!(inst.machine.encoding, Encoding::Vopc | Encoding::Vop3)
+                    && alu.sdwa.is_none()
+                    && alu.dpp.is_none()
+                    && alu.neg == 0
+                    && alu.abs == 0
+                    && !alu.clamp
+                    && alu.omod == 0
+                    && alu.src.len() == 2 =>
+            {
+                let rest = name
+                    .strip_prefix("v_cmp_")
+                    .or_else(|| name.strip_prefix("v_cmpx_"))?;
+                (rest, [alu.src[0], alu.src[1]])
+            }
+            (Fields::Sop { src, imm: None, .. }, Atom::Uniform(_)) if src.len() == 2 => {
+                (name.strip_prefix("s_cmp_")?, [src[0], src[1]])
+            }
+            _ => return None,
+        };
+        let (rel, ty) = rest.split_once('_')?;
+        let signed = match ty {
+            "u32" => false,
+            "i32" => true,
+            _ => return None,
+        };
+        match rel {
+            "f" => return Some(Cond::Fixed(false)),
+            "t" => return Some(Cond::Fixed(true)),
+            _ => {}
+        }
+        let x = self.compare_word(inst, cb, ops[0], path)?;
+        let y = self.compare_word(inst, cb, ops[1], path)?;
+        let lt = Rel::Lt { signed };
+        Some(match rel {
+            "eq" => Cond::Compare(Rel::Eq, [x.min(y), x.max(y)], false),
+            "ne" | "lg" => Cond::Compare(Rel::Eq, [x.min(y), x.max(y)], true),
+            "lt" => Cond::Compare(lt, [x, y], false),
+            "ge" => Cond::Compare(lt, [x, y], true),
+            "gt" => Cond::Compare(lt, [y, x], false),
+            "le" => Cond::Compare(lt, [y, x], true),
+            _ => return None,
+        })
+    }
+
+    /// A compare's 32-bit operand on `path`: a constant where it is one
+    /// there (a phi of the block the lane is in, by the edge it came from;
+    /// one of the join's, by the join's edge), else the value it reads.
+    fn compare_word(&self, inst: &Inst, cb: usize, op: Operand, path: &Path) -> Option<Op> {
+        let reg = match op {
+            Operand::Const(c) => return crate::resource::inline(c).map(Op::Word),
+            Operand::Literal(k) => return Some(Op::Word(k)),
+            Operand::Scalar { code: NULL, .. } => return Some(Op::Word(0)),
+            Operand::Scalar { code, dwords: 1 } => Reg::S(code),
+            Operand::Vector { reg, dwords: 1 } => Reg::V(reg),
+            _ => return None,
+        };
+        let mut x = inst.read(reg)?;
+        let block = &self.x.p.blocks[cb];
+        if cb == path.at
+            && let Some(from) = path.from
+            && let Some(phi) = block.phis.iter().find(|phi| phi.value == x)
+        {
+            x = phi.args[block.preds.iter().position(|&q| q == from)?];
+        }
+        if path.tainted.contains(&x) {
+            return None;
+        }
+        Some(
+            match path.joined.get(&x).copied().or_else(|| self.word_of(x)) {
+                Some(k) => Op::Word(k),
+                None => Op::Value(x),
+            },
+        )
+    }
+
+    /// The DXIL constant an IR value is, as a dword.
+    fn word_of(&self, v: Value) -> Option<u32> {
+        match self.vals.get(&v)? {
+            Val::I32(x) => self.s.m.int_value(*x).map(|k| k as u32),
+            _ => None,
+        }
+    }
+}
+
+/// Counts a console-flow join that takes a descriptor's dword as undefined
+/// without proof (see the descriptor-word rule of [`Lower::fill_phis`]).
+fn unproven_join() -> bool {
+    crate::emit::UNPROVEN_DESCRIPTOR_JOINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Blocks [`Lower::unread_on_edge`] searches at most (each a visit of a
+/// block by an edge, again when what reaches it changes). 4096 ended the
+/// search in the large character pixel programs (33 KiB of code), where
+/// the taint goes far before every register holding it is written again.
+const UNREAD_STEPS: usize = 1 << 16;
+/// Atoms a path keeps at most (the latest).
+const MAX_KNOWN: usize = 32;
+/// Atoms of a condition beyond which a path learns nothing from it.
+const MAX_LEARN: usize = 16;
+
+/// What a lane knows on a path from a join it entered by one edge
+/// ([`Lower::unread_on_edge`]).
+#[derive(Clone, Copy)]
+struct Path<'p> {
+    /// The constants the join's phis take on that edge.
+    joined: &'p HashMap<Value, u32>,
+    /// The block the lane is in, and the one it came from (none: unknown).
+    at: usize,
+    from: Option<usize>,
+    /// Atoms that what the lane passed decides, since the last back edge.
+    known: &'p [(Atom, bool)],
+    /// Values derived from the edge's (`unread_on_edge`): their atoms and
+    /// operands are not known.
+    tainted: &'p [Value],
+}
+
+/// The IR value an atom is of, if any.
+fn atom_of(a: Atom) -> Option<Value> {
+    match a {
+        Atom::Lane(v) | Atom::Uniform(v) | Atom::Phi(v) | Atom::Quad(v) | Atom::Opaque(v) => {
+            Some(v)
+        }
+        Atom::Constant(_) => None,
+    }
+}
+
+/// A path's state in [`Lower::unread_on_edge`], merged over the paths that
+/// enter a block by the same edge.
+#[derive(Clone)]
+struct Taint {
+    /// What the lane knows ([`Path::known`]).
+    known: Vec<(Atom, bool)>,
+    /// Registers holding the edge's value or one derived from it.
+    regs: Vec<Reg>,
+    /// Those values.
+    values: Vec<Value>,
+    /// Whether the join's constants still hold (not back at the join).
+    fresh: bool,
+}
+
+impl Taint {
+    /// Adds what another path brings (fewer facts, more taint): whether it
+    /// changed.
+    fn merge(&mut self, other: &Taint) -> bool {
+        let was = (
+            self.known.len(),
+            self.regs.len(),
+            self.values.len(),
+            self.fresh,
+        );
+        self.known.retain(|f| other.known.contains(f));
+        for &r in &other.regs {
+            if !self.regs.contains(&r) {
+                self.regs.push(r);
+            }
+        }
+        for &v in &other.values {
+            if !self.values.contains(&v) {
+                self.values.push(v);
+            }
+        }
+        self.fresh &= other.fresh;
+        was != (
+            self.known.len(),
+            self.regs.len(),
+            self.values.len(),
+            self.fresh,
+        )
+    }
+}
+
+/// A lane's bit or an SCC as a comparison ([`Lower::condition`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cond {
+    Fixed(bool),
+    /// The operands in that relation, negated where the flag is set.
+    Compare(Rel, [Op; 2], bool),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rel {
+    Eq,
+    Lt { signed: bool },
+}
+
+impl Rel {
+    fn holds(self, x: u32, y: u32) -> bool {
+        match self {
+            Rel::Eq => x == y,
+            Rel::Lt { signed: false } => x < y,
+            Rel::Lt { signed: true } => (x as i32) < (y as i32),
+        }
+    }
+}
+
+/// A compare's operand: a constant, or the value it reads.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Op {
+    Word(u32),
+    Value(Value),
 }
 
 #[cfg(test)]
@@ -1604,6 +2192,157 @@ mod tests {
             crate::emit::Target::ANY,
         )
         .unwrap();
+        #[cfg(windows)]
+        {
+            use crate::emit::host::{Dispatch, Host, Root, Stride, View};
+            let Ok(host) = Host::new(true) else {
+                eprintln!("no WARP device; skipped");
+                return;
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let data: Vec<u32> = (0..32).map(|t| 1000 + t).collect();
+            let views = [
+                View::Buffer {
+                    data: &data,
+                    stride: Stride::Structured(4),
+                },
+                View::RawUav(32),
+            ];
+            for (choice, want) in [(0, vec![5; 32]), (1, data.clone())] {
+                let mut user = vec![0; (cs.user_data_dwords() as usize).max(2)];
+                user[1] = choice;
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(user))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(out[0], want, "s1 = {choice}");
+            }
+        }
+    }
+
+    /// [`DESCRIPTOR_JOIN`] without the join's test (its `s_cmp` and
+    /// `s_cbranch_scc0` made `s_nop`): every lane reads the joined s8, so
+    /// where s1 chose the load it reads the descriptor's first dword, an
+    /// address. That stops the program, as a direct read of the dword does
+    /// (the review of meshdata), instead of reading an undefined value.
+    #[test]
+    fn a_descriptor_dword_read_on_its_edge_after_a_join_stops() {
+        const S_NOP: u32 = 0xBF80_0000;
+        let mut words = DESCRIPTOR_JOIN;
+        words[17] = S_NOP;
+        words[18] = S_NOP;
+        // [`FLAG_AND_WORD`] with the flag -1 on both edges: on the
+        // descriptor's, whether the branch skips the store depends on s8.
+        let mut beside = FLAG_AND_WORD;
+        beside[5] = 0x7E0A_02C1; // v_mov_b32 v5, -1
+        for words in [&words[..], &beside[..]] {
+            let mut p = descriptor_join(ResourceType::Srv);
+            p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let r = emit_for(&p, crate::emit::Target::ANY);
+            assert!(
+                matches!(
+                    r,
+                    Err(crate::ShaderError::Unsupported {
+                        what: "a descriptor's address or format read as data",
+                        ..
+                    })
+                ),
+                "{r:?}"
+            );
+        }
+    }
+
+    /// The console flow's shortcut of the descriptor-word rule: the join of
+    /// [`a_descriptor_dword_read_on_its_edge_after_a_join_stops`] (s8 read
+    /// on both edges) after a loop whose lane read makes the program run in
+    /// the console flow (`lane_read_loop_tests`). There the join keeps the
+    /// undefined value without proof and is counted; the same join in the
+    /// per-lane form stops (the test above).
+    #[test]
+    fn the_console_flow_keeps_a_descriptor_join_unproven_and_counts_it() {
+        use std::sync::atomic::Ordering;
+        const S_NOP: u32 = 0xBF80_0000;
+        let mut words = vec![
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+            0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+            0xBF88_0006, // s_cbranch_execz -> end
+            0xD760_0009,
+            0x0001_0300, // loop: v_readlane_b32 s9, v0, 1
+            0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+            0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF89_FFFA, // s_cbranch_execnz -> loop
+            0x887E_0A7E, // end: s_or_b32 exec_lo, exec_lo, s10
+        ];
+        let mut join = DESCRIPTOR_JOIN;
+        join[17] = S_NOP;
+        join[18] = S_NOP;
+        words.extend(join);
+        let mut p = descriptor_join(ResourceType::Srv);
+        p.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let before = crate::emit::UNPROVEN_DESCRIPTOR_JOINS.load(Ordering::Relaxed);
+        emit_for(&p, crate::emit::Target::ANY).expect("translated in the console flow");
+        let flow = crate::emit::last_module_summary();
+        assert!(flow.contains("console flow"), "{flow}");
+        assert!(crate::emit::UNPROVEN_DESCRIPTOR_JOINS.load(Ordering::Relaxed) > before);
+    }
+
+    /// [`DESCRIPTOR_JOIN`] in the form of the material and character pixel
+    /// programs (0xb9b18de at 0x1100): a flag v5 (0 on the descriptor's
+    /// edge, -1 on the data's), and at the join the joined s8 tested beside
+    /// it, `flag && s8 != 0` as masks (`s_xor`, `s_cmp` + `s_cselect`,
+    /// `s_or`, then `s_cbranch_vccnz` past the store). On the descriptor's
+    /// edge the flag alone takes the branch, whatever s8 holds: the dword
+    /// is dead there and the program translates; both edges give what the
+    /// console does (on WARP), as [`DESCRIPTOR_JOIN`] does.
+    const FLAG_AND_WORD: [u32; 30] = [
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0009, // s_cbranch_scc1 -> 0x44
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_2000,
+        0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x8003_0204, // buffer_store_dword v2, v4, s[12:15], 0 offen
+        0xBF82_0002, // s_branch -> 0x4c
+        0xBE88_0385, // 0x44: s_mov_b32 s8, 5
+        0x7E0A_02C1, // v_mov_b32 v5, -1
+        0x7D84_0AC1, // 0x4c: v_cmp_eq_u32 vcc_lo, -1, v5
+        0x8906_C16A, // s_xor_b32 s6, vcc_lo, -1
+        0xBF06_8008, // s_cmp_eq_u32 s8, 0
+        0x8507_807E, // s_cselect_b32 s7, exec_lo, 0
+        0x8806_0706, // s_or_b32 s6, s6, s7
+        0x876A_067E, // s_and_b32 vcc_lo, exec_lo, s6
+        0xBF87_0003, // s_cbranch_vccnz -> 0x74
+        0x7E06_0208, // v_mov_b32 v3, s8
+        0xE070_1000,
+        0x8003_0304, // buffer_store_dword v3, v4, s[12:15], 0 offen
+        S_ENDPGM,    // 0x74
+    ];
+
+    #[test]
+    fn a_descriptor_dword_tested_beside_a_deciding_flag_is_dead_on_its_edge() {
+        let mut p = descriptor_join(ResourceType::Srv);
+        p.code = FLAG_AND_WORD.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let cs = emit_for(&p, crate::emit::Target::ANY).unwrap();
         #[cfg(windows)]
         {
             use crate::emit::host::{Dispatch, Host, Root, Stride, View};

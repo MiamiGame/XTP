@@ -54,9 +54,16 @@
 //! most, by an instruction on every one of them (so a vertex can be
 //! written and emitted on either side of a branch): the copy shader reads
 //! the ring once the program is done, D3D12 the outputs at each emit, and
-//! these rules make the two the same. Programs that break them are
-//! refused, as are emits on other streams than 0: none of the title's
-//! programs writes one, so the ring layout of streams 1 to 3 is not known.
+//! these rules make the two the same. A write in a loop must also run for
+//! every lane in its block: a lane its EXEC leaves out on a later pass
+//! keeps the dword an earlier pass wrote, where the host keeps the last
+//! pass's ([`LOOPED`]). Programs that break them are refused, as are emits
+//! on other streams than 0: none of the title's programs writes one, so
+//! the ring layout of streams 1 to 3 is not known.
+//!
+//! Only the ring dwords a signature element holds are converted: a write
+//! of a whole row (`ds_write2_b64`) into a short last row also moves
+//! dwords nothing reads, which may hold values with no host form.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -96,6 +103,11 @@ pub(crate) const TWICE: Why =
     "a geometry shader output written twice on the paths to its vertex's emit";
 pub(crate) const SOME_PATHS: Why =
     "a geometry shader output written on some paths to its vertex's emit only";
+/// A GSVS write in a loop under an EXEC narrower than its block's lanes
+/// (Codex review 3983f844): a lane left out on a later pass keeps in the
+/// ring what an earlier pass wrote, the host the last pass's value.
+pub(crate) const LOOPED: Why =
+    "a geometry shader output written in a loop under a narrower lane mask";
 pub(crate) const NOT_INPUT: Why =
     "a geometry shader reading a ring dword its input signature does not hold";
 pub(crate) const VERTICES: Why = "a geometry shader beyond D3D12's 1024 output vertices";
@@ -1212,6 +1224,11 @@ pub(crate) struct GsPlan {
     /// was written (dwords no path to the emit writes are left out: the
     /// console's ring holds nothing defined there either).
     pub emits: BTreeMap<Site, Vec<Written>>,
+    /// The GSVS writes in a loop (their block on a cycle): each may run
+    /// more than once before its vertex's emit, and the lowering keeps its
+    /// last pass's values, which are the ring's only where every lane in
+    /// the block writes ([`LOOPED`]).
+    pub looped: BTreeSet<Site>,
     /// The most vertices a path to the end emits.
     pub emitted: u32,
     /// As [`EsPlan::address_only`], with the GS wave id the messages read
@@ -1491,6 +1508,11 @@ pub(crate) fn gs_plan(p: &Program, shape: &GsShape) -> Result<GsPlan, Why> {
         }
         emits.insert(site, dwords);
     }
+    let looped = writes
+        .iter()
+        .map(|w| w.site)
+        .filter(|&(b, _)| paths.reach[b].contains(&b))
+        .collect();
     let emitted = order
         .iter()
         .filter(|&&b| p.blocks[b].exit.successors().is_empty())
@@ -1502,6 +1524,7 @@ pub(crate) fn gs_plan(p: &Program, shape: &GsShape) -> Result<GsPlan, Why> {
         writes,
         messages: sent,
         emits,
+        looped,
         emitted,
         address_only: address_only(p, &uses),
     })
@@ -1763,8 +1786,9 @@ impl Vertices {
 
     /// Emits on stream 0 the vertex whose dwords `dwords` lists (an emit's
     /// [`GsPlan::emits`]): those `outputs` (stream 0's output signature)
-    /// holds, then `emitStream`. Each write must have been kept first, as
-    /// its dominating the emit lets the lowering do.
+    /// holds, then `emitStream`. Each write of such a dword must have been
+    /// kept first, as its dominating the emit lets the lowering do; the
+    /// other dwords are no output, and the lowering keeps none of them.
     pub(crate) fn emit(
         &self,
         s: &mut Shader,
@@ -1773,10 +1797,11 @@ impl Vertices {
         dwords: &[Written],
     ) -> Result<(), Why> {
         for w in dwords {
+            let Some((id, col)) = element_at(outputs, w.dword) else {
+                continue;
+            };
             let &value = self.values.get(&(w.site, w.reg)).ok_or(SOME_PATHS)?;
-            if let Some((id, col)) = element_at(outputs, w.dword) {
-                store(s, block, &outputs[id as usize], id, col, value);
-            }
+            store(s, block, &outputs[id as usize], id, col, value);
         }
         let (stream, void) = (s.m.i8(0), s.t.void);
         s.op(block, "emitStream", Attr::NoUnwind, void, 97, &[stream]);
@@ -1908,6 +1933,8 @@ pub(super) struct Merged {
     writes: HashMap<Site, Vec<(Reg, Slot)>>,
     messages: HashMap<Site, Message>,
     emits: BTreeMap<Site, Vec<Written>>,
+    /// GS ring writes in a loop ([`GsPlan::looped`]).
+    looped: BTreeSet<Site>,
     address_only: BTreeSet<Site>,
     vertices: Vertices,
     /// The shader's signatures, as declared.
@@ -1930,6 +1957,7 @@ impl Lower<'_> {
             writes: HashMap::new(),
             messages: HashMap::new(),
             emits: BTreeMap::new(),
+            looped: BTreeSet::new(),
             address_only: BTreeSet::new(),
             vertices: Vertices::default(),
             inputs: Vec::new(),
@@ -1966,6 +1994,7 @@ impl Lower<'_> {
                     .collect();
                 m.messages = plan.messages.into_iter().collect();
                 m.emits = plan.emits;
+                m.looped = plan.looped;
                 m.address_only = plan.address_only;
                 self.s.geometry = Some(shape);
             }
@@ -2004,12 +2033,15 @@ impl Lower<'_> {
         if let Some(dwords) = m.writes.get(&site) {
             let r = match m.stage {
                 HwStage::Es => self.item_write(inst, b, i, &m.outputs, dwords),
-                _ => dwords.iter().try_for_each(|&(reg, _)| {
-                    let v = inst.read(reg).ok_or("an unread operand")?;
-                    let value = self.i32_of(v)?;
-                    m.vertices.write(site, reg, value);
-                    Ok(())
-                }),
+                _ => {
+                    let looped = m.looped.contains(&site);
+                    self.vertex_write(inst, b, i, &m.outputs, dwords, looped)
+                        .map(|kept| {
+                            for (reg, value) in kept {
+                                m.vertices.write(site, reg, value);
+                            }
+                        })
+                }
             };
             return Some(r.map_err(|why| unsupported(offset, why)));
         }
@@ -2043,8 +2075,46 @@ impl Lower<'_> {
         Ok(())
     }
 
+    /// A GS ring write: the values of the dwords stream 0's outputs hold,
+    /// which the lowering keeps until their vertex's emit. The others (a
+    /// short last row's fill) are no output, whatever they hold.
+    ///
+    /// The value kept is what the write's lanes store, and an emit's lanes
+    /// read it whatever EXEC the write had: a lane outside it leaves the
+    /// ring dword as it was. Where the write runs once, that is nothing
+    /// the program wrote (no other write of the dword reaches the emit:
+    /// [`TWICE`]), any value; in a loop it is an earlier pass's, which the
+    /// host does not keep: refused there unless every lane in the block
+    /// writes ([`LOOPED`]).
+    fn vertex_write(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        outputs: &[SigElement],
+        dwords: &[(Reg, Slot)],
+        looped: bool,
+    ) -> Result<Vec<(Reg, V)>, Why> {
+        let held: Vec<Reg> = dwords
+            .iter()
+            .filter(|&&(_, slot)| element_at(outputs, slot.dword).is_some())
+            .map(|&(reg, _)| reg)
+            .collect();
+        if looped && !held.is_empty() && self.guard(b, i)?.is_some() {
+            return Err(LOOPED);
+        }
+        held.into_iter()
+            .map(|reg| {
+                let v = inst.read(reg).ok_or("an unread operand")?;
+                Ok((reg, self.i32_of(v)?))
+            })
+            .collect()
+    }
+
     /// An ES ring write: each item dword is the vertex shader's output at
-    /// its row and column, stored by the lanes the instruction runs in.
+    /// its row and column, stored by the lanes the instruction runs in. A
+    /// dword no output element holds (a short last row's fill) is no
+    /// output, whatever it holds.
     fn item_write(
         &mut self,
         inst: &Inst,
@@ -2055,6 +2125,7 @@ impl Lower<'_> {
     ) -> Result<(), Why> {
         let values = dwords
             .iter()
+            .filter(|&&(_, slot)| element_at(outputs, slot.dword).is_some())
             .map(|&(reg, slot)| {
                 let v = inst.read(reg).ok_or("an unread operand")?;
                 Ok((slot.dword, self.i32_of(v)?))

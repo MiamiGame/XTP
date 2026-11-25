@@ -152,6 +152,7 @@ impl RawWindow {
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
+    pub const FORCE_EARLY_DEPTH_STENCIL: u64 = 1 << 3;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -164,6 +165,10 @@ pub(crate) mod flags {
     pub const SAMPLER_HEAP: u64 = 1 << 31;
     pub const ATOMIC_INT64_HEAP: u64 = 1 << 32;
 }
+
+#[cfg(test)]
+#[path = "early_depth_tests.rs"]
+mod early_depth_tests;
 
 pub(crate) struct Types {
     pub void: Ty,
@@ -210,6 +215,7 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    pub root_uavs: Vec<(u8, V)>,
     /// Handle of the runtime stride table (`t0` in [`STRIDE_SPACE`]), if
     /// read.
     pub stride_table: Option<V>,
@@ -290,6 +296,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
             stride_table: None,
             flags: 0,
             nonuniform_handles: 0,
@@ -391,13 +398,23 @@ impl Shader {
         h
     }
 
-    /// The handle of the root SRV (a raw buffer) of root parameter `slot`.
-    pub fn root_srv_handle(&mut self, slot: u8) -> V {
-        if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == slot) {
+    /// Vue brute du paramètre racine. Ported from Marvisak/VIctory#1077 (head 873548f) by DuarttBR.
+    pub fn root_raw_handle(&mut self, slot: u8, unordered: bool) -> V {
+        let slots = if unordered {
+            &self.root_uavs
+        } else {
+            &self.root_srvs
+        };
+        if let Some(&(_, h)) = slots.iter().find(|r| r.0 == slot) {
             return h;
         }
         let r = self.m.i32(u32::from(slot));
-        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(0)];
+        let bind = [
+            r,
+            r,
+            self.m.i32(ROOT_CBV_SPACE),
+            self.m.i8(u8::from(unordered)),
+        ];
         let bind = self.m.aggregate(self.t.bind, &bind);
         let f = self.m.bool(false);
         let block = self.entry;
@@ -409,9 +426,13 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11, 0);
+        let h = self.annotate(block, h, if unordered { 0x100b } else { 11 }, 0);
         self.flags |= flags::RAW_BUFFERS;
-        self.root_srvs.push((slot, h));
+        if unordered {
+            self.root_uavs.push((slot, h));
+        } else {
+            self.root_srvs.push((slot, h));
+        }
         h
     }
 
@@ -516,6 +537,23 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        // An unused rasterizer input can be omitted. Keeping the front face
+        // beside a live interpolated float would either give it an undefined
+        // mode (which crashes the AMD compiler) or change the float's mode.
+        if self.pixel
+            && let Some(id) = self
+                .inputs
+                .iter()
+                .position(|e| e.kind == 13 && e.usage == 0)
+            && let Some(row) = self.inputs[id].row
+            && self
+                .inputs
+                .iter()
+                .any(|e| e.row == Some(row) && e.usage != 0 && e.interp > 1)
+        {
+            self.m.remove_pixel_input(id, self.inputs.len());
+            self.inputs.remove(id);
+        }
         one_mode_per_row(&mut self.inputs, self.pixel);
         one_mode_per_row(&mut self.outputs, false);
         one_mode_per_row(&mut self.prims, false);
@@ -538,6 +576,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || !self.root_uavs.is_empty()
             || self.stride_table.is_some()
         {
             let empty = self.m.md_str("");
@@ -631,6 +670,41 @@ impl Shader {
                 }
                 srvs = Some(self.m.md_node(list));
             }
+            let mut uavs = None;
+            if !self.root_uavs.is_empty() {
+                let ty = self
+                    .m
+                    .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let no = self.m.bool(false);
+                let no = self.m.md_value(no);
+                let mut list = Vec::new();
+                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                    let ops = vec![
+                        Some(i32c(&mut self, n as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(no),
+                        Some(no),
+                        Some(no),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+
+                    bindings.push(Binding {
+                        kind: 7,
+                        space: ROOT_CBV_SPACE,
+                        register: u32::from(slot),
+                        dxil_kind: 11,
+                    });
+                }
+                uavs = Some(self.m.md_node(list));
+            }
             let mut samplers = None;
             if self.samplers > 0 {
                 let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
@@ -660,11 +734,12 @@ impl Shader {
                 }
                 samplers = Some(self.m.md_node(list));
             }
-            resources = Some(self.m.md_node(vec![srvs, None, cbvs, samplers]));
+            resources = Some(self.m.md_node(vec![srvs, uavs, cbvs, samplers]));
             // PSV0 lists them as the module does: CBVs, samplers, SRVs.
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,
                 1 => 1,
+                7 => 3,
                 _ => 2,
             });
         }

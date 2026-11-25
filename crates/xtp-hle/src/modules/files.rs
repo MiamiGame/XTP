@@ -1692,57 +1692,48 @@ pub extern "C" fn _fsopen(path: *const c_char, mode: *const c_char, share: i32) 
 const INVALID_USER_BUFFER: u32 = 1784;
 const IO_PENDING: u32 = 997;
 
-/// Overlapped reads into title memory still under way: the `OVERLAPPED`
-/// each was given, and the announcement that holds its destination open
-/// (and, once it drops, notes it written).
-static PENDING_READS: Mutex<Vec<(usize, xtp_gpu::KernelWrite)>> = Mutex::new(Vec::new());
-static READS_PENDING: std::sync::Condvar = std::sync::Condvar::new();
+/// Le statut du noyau reste associé à la garde de la source ou de la destination.
+type PendingIo = (usize, Box<dyn Send>);
+static PENDING_IO: Mutex<Vec<PendingIo>> = Mutex::new(Vec::new());
+static IO_PENDING_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
 
-/// Holds the destination of overlapped read `overlapped` open until it
-/// completes. A thread of ours looks every millisecond while some are
-/// pending, so that copies take their pages soon after the device wrote
-/// them, not only at the title's next read (BTP 6 calls none of the
-/// completion functions we could hook).
-fn hold_until_done(overlapped: usize, writing: xtp_gpu::KernelWrite) {
+fn hold_until_done(overlapped: usize, buffer: impl Send + 'static) {
     static WATCHER: std::sync::Once = std::sync::Once::new();
     WATCHER.call_once(|| {
         let spawned = std::thread::Builder::new()
-            .name("xtp-overlapped-reads".into())
+            .name("xtp-overlapped-io".into())
             .spawn(|| {
                 loop {
                     {
-                        let mut pending = PENDING_READS.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut pending = PENDING_IO.lock().unwrap_or_else(|e| e.into_inner());
                         while pending.is_empty() {
-                            pending = READS_PENDING
+                            pending = IO_PENDING_CHANGED
                                 .wait(pending)
                                 .unwrap_or_else(|e| e.into_inner());
                         }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
-                    finish_overlapped_reads();
+                    finish_overlapped_io();
                 }
             });
         if let Err(e) = spawned {
             tracing::warn!(
-                "overlapped reads are let go only at the next read: no thread to watch them ({e})"
+                "overlapped buffers are released at the next I/O call: no thread to watch them ({e})"
             );
         }
     });
-    PENDING_READS
+    PENDING_IO
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((overlapped, writing));
-    READS_PENDING.notify_one();
+        .push((overlapped, Box::new(buffer)));
+    IO_PENDING_CHANGED.notify_one();
 }
 
-/// Lets go of the destinations of the overlapped reads that completed: the
-/// kernel replaces the `OVERLAPPED`'s status (its first field,
-/// `STATUS_PENDING` meanwhile) when it completes one. Read with
-/// `ReadProcessMemory`: the title may free the structure once its read is
-/// done, and one that cannot be read is taken as done.
-fn finish_overlapped_reads() {
+/// Windows remplace STATUS_PENDING dans le premier champ de l'OVERLAPPED
+/// à la fin de l'E/S. Le titre peut ensuite libérer cette structure.
+fn finish_overlapped_io() {
     const STATUS_PENDING: usize = 0x103;
-    let mut pending = PENDING_READS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pending = PENDING_IO.lock().unwrap_or_else(|e| e.into_inner());
     if pending.is_empty() {
         return;
     }
@@ -1753,6 +1744,7 @@ fn finish_overlapped_reads() {
 fn read_own_usize(at: usize) -> Option<usize> {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let _pin = xtp_gpu::pin_copy_back(at, size_of::<usize>());
     let (mut value, mut read) = (0usize, 0usize);
     // SAFETY: reads into a local; the call fails, rather than faults, on
     // memory that cannot be read.
@@ -1776,7 +1768,7 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     let host = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
-    finish_overlapped_reads();
+    finish_overlapped_io();
     let writing = xtp_gpu::kernel_will_write(buffer as usize, len as usize);
     let mut done = host(file, buffer, len, read, overlapped);
     // SAFETY: plain reads and writes of this thread's last error.
@@ -1801,9 +1793,63 @@ pub extern "system" fn ReadFile(
     done
 }
 
+pub extern "system" fn WriteFile(
+    file: *mut c_void,
+    buffer: *const u8,
+    len: u32,
+    written: *mut u32,
+    overlapped: *mut c_void,
+) -> i32 {
+    let host = host!("kernel32.dll", "WriteFile": extern "system" fn(*mut c_void, *const u8, u32, *mut u32, *mut c_void) -> i32);
+    finish_overlapped_io();
+    let pin = xtp_gpu::pin_title_read(buffer as usize, len as usize);
+    let result = host(file, buffer, len, written, overlapped);
+    // SAFETY: sauvegarde de la dernière erreur sur le thread appelant.
+    let error = unsafe { GetLastError() };
+    if let Some(pin) = pin
+        && result == 0
+        && error == IO_PENDING
+        && !overlapped.is_null()
+    {
+        hold_until_done(overlapped as usize, pin);
+    }
+    // SAFETY: le titre doit recevoir l'erreur de WriteFile.
+    unsafe { SetLastError(error) };
+    result
+}
+
+pub extern "C" fn fwrite(buffer: *const u8, size: usize, count: usize, stream: File) -> usize {
+    let _pin = xtp_gpu::pin_title_read(buffer as usize, size.saturating_mul(count));
+    host!("ucrtbase.dll", "fwrite": extern "C" fn(*const u8, usize, usize, File) -> usize)(
+        buffer, size, count, stream,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn check_fwrite_from(buffer: *const u8, len: usize, expected: u8) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut path = wide_of(&dir.path().join("pending.bin"));
+    path.push(0);
+    let mode: Vec<_> = "w+b\0".encode_utf16().collect();
+    let file = host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
+        path.as_ptr(),
+        mode.as_ptr(),
+    );
+    assert!(!file.is_null());
+    assert_eq!(fwrite(buffer, 1, len, file), len);
+    host!("ucrtbase.dll", "rewind": extern "C" fn(File))(file);
+    let mut bytes = vec![0; len];
+    assert_eq!(fread(bytes.as_mut_ptr(), 1, len, file), len);
+    assert!(bytes.iter().all(|&byte| byte == expected));
+    assert_eq!(
+        host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32)(file),
+        0
+    );
+}
+
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    finish_overlapped_reads();
+    finish_overlapped_io();
     let _writing = xtp_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
     host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
@@ -2042,6 +2088,8 @@ pub(crate) fn module() -> HleModule {
         ],
         exports: vec![
             hle_export!(ReadFile),
+            hle_export!(WriteFile),
+            hle_export!(fwrite),
             hle_export!(fread),
             hle_export!(CreateFileW),
             hle_export!(CreateFileA),
@@ -2141,9 +2189,9 @@ mod tests {
         let destination = [0u8; 64];
         let writing = xtp_gpu::kernel_will_write(destination.as_ptr() as usize, 64);
         hold_until_done(at, writing);
-        let held = || PENDING_READS.lock().unwrap().iter().any(|&(o, _)| o == at);
+        let held = || PENDING_IO.lock().unwrap().iter().any(|&(o, _)| o == at);
         std::thread::sleep(std::time::Duration::from_millis(20));
-        finish_overlapped_reads();
+        finish_overlapped_io();
         assert!(held(), "still pending");
         // SAFETY: our local, as the kernel writes the status on completion.
         unsafe { (&raw mut status).write_volatile(0) };

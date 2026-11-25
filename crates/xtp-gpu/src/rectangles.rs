@@ -290,7 +290,7 @@ cbuffer Params : register(b0) {
     uint vert_capacity;
     uint need_verts;
     uint indexed;
-    uint pad;
+    uint first_record;
 };
 // Buffers as 32-bit words, and no root signature attribute: Wine's system
 // compiler (vkd3d-shader) has no Load on RWByteAddressBuffer and ignores the
@@ -314,7 +314,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint r = id.x;
     uint live = records;
     if (has_count != 0u) {
-        live = min(count_buf[0], records);
+        uint count = count_buf[0];
+        live = min(count - min(count, first_record), records);
     }
     if (r == 0u) {
         alloc[1] = live;
@@ -382,6 +383,8 @@ uint vertex_id(uint at, uint base) {
     uint pos = index_bias + at * index_bytes;
     uint word = indices[pos >> 2u];
     uint index = index_bytes == 4u ? word : (word >> ((pos & 2u) * 8u)) & 0xffffu;
+    // Les listes de rectangles du titre utilisent la coupure désactivée.
+    // Tous les indices participent au triplet, y compris ceux à bits tous à un.
     uint id = index + base;
     if (asint(base) >= 0 && id < index) return 0xffffffffu;
     return id;
@@ -747,6 +750,41 @@ pub(crate) struct Scratch {
     vertices: Option<Buffer>,
     /// Made larger when a draw has more records.
     args: Option<Buffer>,
+    direct: Option<DirectPage>,
+}
+
+// Une page mappée de commandes directes. Les anciennes pages restent dans
+// la liste si celle-ci remplit sa page avant la fin de l’enregistrement.
+struct DirectPage {
+    buffer: ID3D12Resource,
+    data: usize,
+    used: usize,
+}
+
+impl DirectPage {
+    fn append(page: &mut Option<Self>, list: &HostList, words: [u32; 5]) -> Option<u64> {
+        const BYTES: usize = 64 << 10;
+        const STEP: usize = 32;
+        if page.as_ref().is_none_or(|p| p.used == BYTES) {
+            let (buffer, data) = host()?.shared_buffer(BYTES as u64)?;
+            *page = Some(Self {
+                buffer,
+                data: data as usize,
+                used: 0,
+            });
+        }
+        let p = page.as_mut()?;
+        if p.used == 0 {
+            list.keep(&p.buffer);
+        }
+        let at = p.used;
+        p.used += STEP;
+        // SAFETY: cette tranche de 32 octets reste réservée jusqu’à la retraite de la liste.
+        unsafe {
+            ((p.data + at) as *mut [u32; 5]).write_unaligned(words);
+            Some(p.buffer.GetGPUVirtualAddress() + at as u64)
+        }
+    }
 }
 
 /// One buffer of a [`Scratch`].
@@ -822,6 +860,9 @@ impl Scratch {
 /// run, so its buffers are back in the common state. A large arguments
 /// buffer goes.
 pub(crate) fn give_back(mut scratch: Scratch) {
+    if let Some(page) = &mut scratch.direct {
+        page.used = 0;
+    }
     for b in [&mut scratch.vertices, &mut scratch.args]
         .into_iter()
         .flatten()
@@ -829,20 +870,25 @@ pub(crate) fn give_back(mut scratch: Scratch) {
         b.state = D3D12_RESOURCE_STATE_COMMON;
         b.kept = false;
     }
-    if scratch
-        .vertices
-        .as_ref()
-        .is_some_and(|v| v.len > SCRATCH_BYTES)
-    {
-        scratch.vertices = None;
-    }
     if scratch.args.as_ref().is_some_and(|a| a.len > ARGS_POOLED) {
         scratch.args = None;
     }
-    if scratch.vertices.is_none() && scratch.args.is_none() {
+    if scratch.vertices.is_none() && scratch.args.is_none() && scratch.direct.is_none() {
         return;
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    // Une seule grande réserve inactive, même si plusieurs listes ont grandi.
+    let size = |s: &Scratch| s.vertices.as_ref().map_or(0, |v| v.len);
+    if size(&scratch) > SCRATCH_BYTES {
+        if let Some(other) = pool.iter_mut().find(|s| size(s) > SCRATCH_BYTES) {
+            if size(other) < size(&scratch) {
+                std::mem::swap(&mut other.vertices, &mut scratch.vertices);
+            }
+            scratch.vertices = None;
+        } else if pool.len() == POOLED {
+            pool.pop();
+        }
+    }
     if pool.len() < POOLED {
         pool.push(scratch);
     }
@@ -913,10 +959,20 @@ fn take_scratch<'a>(
     let s = match held {
         Some(s) => s,
         None => {
-            let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let best = pool
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| {
+                    let bytes = s.vertices.as_ref().map_or(0, |v| v.len);
+                    (bytes < vertices_len, bytes.abs_diff(vertices_len))
+                })
+                .map(|(i, _)| i);
+            let pooled = best.map(|i| pool.swap_remove(i));
             held.insert(pooled.unwrap_or(Scratch {
                 vertices: None,
                 args: None,
+                direct: None,
             }))
         }
     };
@@ -999,6 +1055,22 @@ pub(crate) enum Records<'a> {
     Direct([u32; 5]),
 }
 
+/// État partagé par les lots d’un seul dessin, dont la liste conserve les commandes bornées.
+#[derive(Default)]
+pub(crate) struct Batches {
+    writes: crate::indirect::Writes,
+    bounded_gpu: Option<u64>,
+}
+
+impl Batches {
+    pub(crate) fn new(writes: crate::indirect::Writes) -> Self {
+        Self {
+            writes,
+            bounded_gpu: None,
+        }
+    }
+}
+
 /// Clamps an indirect rectangle draw's `max` records of `stride` bytes at
 /// title address `arguments` (host copy `args`), the record count at
 /// `count` if the title gives one, and records the passes that rewrite
@@ -1016,10 +1088,11 @@ pub(crate) fn expand(
     held: &mut Option<Scratch>,
     inputs: &[Input],
     vertices: &[(u64, u32, u32); 32],
-    (records, stride, max): (Records, u32, u32),
+    (records, stride, range): (Records, u32, std::ops::Range<u32>),
     index: Option<crate::draw::IndexView>,
     count: Option<(&Arc<Shadow>, u64)>,
-    stats: Option<u64>,
+    stats: Option<(u64, u32)>,
+    batches: &mut Batches,
 ) -> Result<Prepared, &'static str> {
     if stride < if index.is_some() { 20 } else { 16 }
         || !stride.is_multiple_of(4)
@@ -1027,7 +1100,9 @@ pub(crate) fn expand(
     {
         return Err("rectangle records short or not 4-byte aligned");
     }
-    if max > MAX_RECORDS {
+    let total = range.end;
+    let first = range.start;
+    if first > total || total > MAX_RECORDS {
         return Err("too many indirect rectangle records");
     }
     if let Some((s, at)) = count
@@ -1095,6 +1170,31 @@ pub(crate) fn expand(
         Records::Direct(words) => words[0],
         Records::Title(..) => 1 << 24,
     };
+    // Le compteur côté titre guide la taille des lots. Le GPU relit le vrai
+    // compteur pour chacun, même si un dispatch précédent vient de le modifier.
+    let per_record = u64::from(source_limit.min(max_per_record) / 3) * 6;
+    let stride_sum: u64 = strides
+        .iter()
+        .map(|&(_, n)| u64::from(n).next_multiple_of(4))
+        .sum();
+    let bytes_per_record = per_record.saturating_mul(stride_sum).max(1);
+    let max = if bytes_per_record.saturating_mul(u64::from(total)) <= SCRATCH_BYTES {
+        total - first
+    } else {
+        let mut word = [0; 4];
+        let hint = count
+            .and_then(|(_, at)| {
+                crate::host::read_into(at as *const u8, &mut word).then(|| u32::from_le_bytes(word))
+            })
+            .unwrap_or(total);
+        // Borne le nombre de passages enregistrés et réutilise les mêmes
+        // sommets entre lots, y compris si le compteur CPU est périmé.
+        let budget = (4 * SCRATCH_BYTES / bytes_per_record).clamp(1, u64::from(u32::MAX)) as u32;
+        hint.min(budget)
+            .max(budget / 4)
+            .max(total.div_ceil(64))
+            .min(total - first)
+    };
     let vertices_needed =
         (u64::from(source_limit.min(max_per_record) / 3) * u64::from(max)).min((1 << 27) / 3) * 6;
     let mut needed = 0u64;
@@ -1149,58 +1249,62 @@ pub(crate) fn expand(
         .map_err(|_| "no immediate writes on the host list")?;
 
     // The title's buffers, as the title left them at this place.
-    let src_args = match records {
+    let (src_args, count_gpu, stride) = match records {
         Records::Title(args, at) => {
-            args.refresh(list, at, u64::from(stride) * u64::from(max.max(1)));
-            args.gpu(at)
+            let gpu = if let Some(gpu) = batches.bounded_gpu {
+                gpu
+            } else {
+                args.refresh(list, at, u64::from(stride) * u64::from(total));
+                if let Some((s, at)) = count {
+                    s.refresh(list, at, 4);
+                }
+                let bounded = crate::indirect::bound(
+                    list,
+                    (&args.buffer, args.offset(at)),
+                    (u32::from(index.is_some()), stride, total),
+                    count.map(|(s, at)| (&s.buffer, s.offset(at))),
+                    stats,
+                    batches.writes,
+                    crate::indirect::Output::Uav,
+                )
+                .ok_or("not bounded (no clamp)")?;
+                // SAFETY: la liste conserve le tampon du compteur et des commandes bornées.
+                let gpu = unsafe { bounded.buffer.GetGPUVirtualAddress() } + bounded.offset;
+                batches.bounded_gpu = Some(gpu);
+                gpu
+            };
+            (gpu + 4, gpu, 24)
         }
         Records::Direct(words) => {
-            let (buffer, data) = host()
-                .and_then(|h| h.shared_buffer(20))
+            let gpu = DirectPage::append(&mut scratch.direct, list, words)
                 .ok_or("no memory for direct rectangle arguments")?;
-            list.keep(&buffer);
-            // SAFETY: a fresh mapped buffer retained until the recording retires.
-            unsafe {
-                data.cast::<[u32; 5]>().write_unaligned(words);
-                buffer.GetGPUVirtualAddress()
-            }
+            (gpu, gpu, stride)
         }
     };
-    if let Some((v, _, shadow)) = &indices {
-        shadow.refresh(list, v.address, v.size.into());
+    if first == 0 {
+        if let Some((v, _, shadow)) = &indices {
+            shadow.refresh(list, v.address, v.size.into());
+        }
+        for s in &sources {
+            s.shadow.refresh(list, s.address, u64::from(s.size));
+        }
     }
-    if let Some((s, at)) = count {
-        s.refresh(list, at, 4);
-    }
-    for s in &sources {
-        s.shadow.refresh(list, s.address, u64::from(s.size));
-    }
-    if matches!(records, Records::Title(..))
-        && !crate::indirect::rewrite(
-            list,
-            src_args,
-            (u32::from(index.is_some()), stride, max),
-            count.map(|(s, at)| s.gpu(at)),
-            None,
-            stats,
-        )
-    {
-        return Err("not bounded (no clamp)");
-    }
+    let _expanding =
+        crate::timestamps::command(list, crate::timestamps::What::RectangleExpansion, None);
 
+    let src_args = src_args + u64::from(first) * u64::from(stride);
     let direct = matches!(records, Records::Direct(_));
     let args_gpu = args_buffer.gpu();
     let (counter, records) = (args_gpu, args_gpu + COUNTER_BYTES);
-    let count_gpu = count.map_or(src_args, |(s, at)| s.gpu(at));
     let rewrite = [
         max,
         stride,
-        u32::from(count.is_some()),
+        u32::from(!direct),
         source_limit,
         capacity,
         u32::from(need_vertices),
         u32::from(index.is_some()),
-        0,
+        first,
     ];
     let mut barriers = Vec::new();
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -1704,10 +1808,11 @@ mod tests {
                 &mut held,
                 &inputs,
                 &bound,
-                (Records::Title(&args_copy, args.address()), 16, 5),
+                (Records::Title(&args_copy, args.address()), 16, 0..5),
                 None,
                 Some((&count_copy, count.address())),
                 None,
+                &mut Default::default(),
             )
             .expect("expanded")
         };
@@ -1776,10 +1881,11 @@ mod tests {
             &mut held,
             &[input(0, 0, 41, false)],
             &bound,
-            (Records::Title(&shadow, args.address()), 16, max),
+            (Records::Title(&shadow, args.address()), 16, 0..max),
             None,
             None,
             None,
+            &mut Default::default(),
         )
         .unwrap();
         let left = run_and_read(&list, &mut held, max as usize, &[]);
@@ -1787,7 +1893,103 @@ mod tests {
         assert!(u64::from(left.counter * stride) > SCRATCH_BYTES);
         assert!(left.records.iter().all(|row| row[0] == count * 2));
         host.drain();
+        let grown = held
+            .as_ref()
+            .unwrap()
+            .vertices
+            .as_ref()
+            .unwrap()
+            .resource
+            .clone();
         done(&mut held);
+        let next = TitleList::new();
+        let mut next_scratch = None;
+        let s = take_scratch(
+            next.host(),
+            &mut next_scratch,
+            ARGS_MIN,
+            u64::from(left.counter * stride),
+        )
+        .unwrap();
+        assert_eq!(s.vertices.as_ref().unwrap().resource, grown);
+        next.run();
+        done(&mut next_scratch);
+    }
+
+    #[test]
+    fn rectangle_batches_use_the_gpu_count_after_a_copy() {
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(_gpu) = crate::testgpu::device(
+            "rectangles::tests::rectangle_batches_use_the_gpu_count_after_a_copy",
+        ) else {
+            return;
+        };
+        let max = 64u32;
+        let (vb, _) = title_bytes(1 << 20, &[]);
+        let (args, shadow) = title_records(&vec![[3, 1, 0, 7]; max as usize]);
+        let (count, count_shadow) = title_bytes(4, &1u32.to_le_bytes());
+        let (actual, _) = title_bytes(4, &(max - 1).to_le_bytes());
+        let list = TitleList::new();
+        assert!(crate::shadow::copy(
+            list.host(),
+            count.address(),
+            actual.address(),
+            4
+        ));
+        let mut bound = [(0, 0, 0); 32];
+        bound[0] = (vb.address(), 1 << 20, 4);
+        let mut held = None;
+        let mut first = 0;
+        let mut batch;
+        let mut batches = Batches::default();
+        loop {
+            batch = expand(
+                list.host(),
+                &mut held,
+                &[input(0, 0, 41, false)],
+                &bound,
+                (Records::Title(&shadow, args.address()), 16, first..max),
+                None,
+                Some((&count_shadow, count.address())),
+                None,
+                &mut batches,
+            )
+            .unwrap()
+            .max;
+            assert!(batch < max);
+            first += batch;
+            if first == max {
+                break;
+            }
+        }
+        let left = run_and_read(&list, &mut held, batch as usize, &[]);
+        assert_eq!(left.count, batch - 1);
+        assert_eq!(left.counter, (batch - 1) * 6);
+        assert_eq!(left.records.last().unwrap()[0], 0);
+        done(&mut held);
+    }
+
+    #[test]
+    fn direct_records_keep_the_first_page_alive_after_rollover() {
+        let Some(_gpu) = crate::testgpu::device(
+            "rectangles::tests::direct_records_keep_the_first_page_alive_after_rollover",
+        ) else {
+            return;
+        };
+        let list = TitleList::new();
+        let mut page = None;
+        let first = DirectPage::append(&mut page, list.host(), [17; 5]).unwrap();
+        let data = page.as_ref().unwrap().data as *const [u32; 5];
+        let second = DirectPage::append(&mut page, list.host(), [23; 5]).unwrap();
+        assert_eq!(second - first, 32);
+        for _ in 2..2048 {
+            DirectPage::append(&mut page, list.host(), [0; 5]).unwrap();
+        }
+        let next = DirectPage::append(&mut page, list.host(), [42; 5]).unwrap();
+        assert_ne!(next, first);
+        // SAFETY: la liste conserve la première page mappée.
+        assert_eq!(unsafe { data.read_unaligned() }, [17; 5]);
+        list.run();
     }
 
     #[test]
@@ -1812,7 +2014,14 @@ mod tests {
             .collect();
         primitive::expand_rects(&triplet, &mut expected, STRIDE, &elements);
         for (format, bytes) in [(57, 2usize), (42, 4)] {
-            let raw: Vec<u8> = [99u32, 99, 3, 1, 2]
+            // R16 : 0xffff devient le sommet 2 après application de la base.
+            // R32 : le triplet hors limites reste dégénéré, le suivant reste aligné.
+            let (raw_indices, base) = if bytes == 2 {
+                ([99u32, 99, 9, 0, 0, 0xffff, 0xfffd, 0xfffe], -65533i32)
+            } else {
+                ([99u32, 99, 1, u32::MAX, 2, 3, 1, 2], -1i32)
+            };
+            let raw: Vec<u8> = raw_indices
                 .into_iter()
                 .flat_map(|i| i.to_le_bytes().into_iter().take(bytes))
                 .collect();
@@ -1822,7 +2031,7 @@ mod tests {
                 size: (raw.len() - bytes) as u32,
                 format,
             };
-            let record = [3u32, 2, 1, (-1i32) as u32, 7];
+            let record = [6u32, 2, 1, base as u32, 7];
             let words: Vec<u8> = record.iter().flat_map(|w| w.to_le_bytes()).collect();
             let (args, shadow) = title_bytes(256, &words);
             let records = if bytes == 2 {
@@ -1837,15 +2046,18 @@ mod tests {
                 &mut held,
                 &inputs,
                 &bound,
-                (records, 20, 1),
+                (records, 20, 0..1),
                 Some(index),
                 None,
                 None,
+                &mut Default::default(),
             )
             .expect("expanded");
-            let left = run_and_read(&list, &mut held, 1, &[(0, 6 * STRIDE)]);
-            assert_eq!(left.records, [[6, 2, 0, 7]]);
-            assert_eq!(left.vertices.unwrap()[0], expected);
+            let left = run_and_read(&list, &mut held, 1, &[(0, 12 * STRIDE)]);
+            assert_eq!(left.records, [[12, 2, 0, 7]]);
+            let expanded = left.vertices.unwrap();
+            assert_eq!(expanded[0][..6 * STRIDE], vec![0; 6 * STRIDE]);
+            assert_eq!(expanded[0][6 * STRIDE..], expected);
             done(&mut held);
         }
         host.drain();
@@ -1880,10 +2092,11 @@ mod tests {
             &mut held,
             &inputs,
             &bound,
-            (Records::Title(&args_copy, args.address()), 16, 1),
+            (Records::Title(&args_copy, args.address()), 16, 0..1),
             None,
             None,
             None,
+            &mut Default::default(),
         )
         .expect("expanded");
         let left = run_and_read(&list, &mut held, 1, &[(0, 6 * STRIDE)]);
@@ -1928,16 +2141,18 @@ mod tests {
         let mut held = Some(Scratch {
             vertices: None,
             args: None,
+            direct: None,
         });
         let prepared = expand(
             list.host(),
             &mut held,
             &inputs,
             &[(0, 0, 0); 32],
-            (Records::Title(&args_copy, args.address()), 16, 4),
+            (Records::Title(&args_copy, args.address()), 16, 0..4),
             None,
             Some((&count_copy, count.address())),
             None,
+            &mut Default::default(),
         )
         .expect("expanded");
         assert!(prepared.views.is_empty());
@@ -2022,10 +2237,11 @@ mod tests {
             &mut held,
             &inputs,
             &bound,
-            (Records::Title(&args_copy, args.address()), 16, 2),
+            (Records::Title(&args_copy, args.address()), 16, 0..2),
             None,
             None,
             None,
+            &mut Default::default(),
         )
         .expect("expanded");
         let (_, layouts) = scratch_layout(&[(0, 10), (2, 6)], SCRATCH_BYTES).expect("a layout");

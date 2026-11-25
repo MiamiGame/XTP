@@ -509,8 +509,14 @@ pub(crate) fn buffer_format(title: u32, unordered: bool) -> u32 {
 
 /// [`buffer_format`] on a device that can do `caps`.
 fn buffer_format_with(caps: &impl Caps, title: u32, unordered: bool) -> u32 {
+    // DXGI ne propose aucun élément typé de trois octets. UNKNOWN sans
+    // stride donne une vue nulle, y compris quand le format 45 est disponible.
+    if (118..=120).contains(&title) {
+        note_buffer_without_format(title, unordered);
+        return 0;
+    }
     let Some(e) = entry(title) else {
-        return super::pc_vertex_format(title);
+        return title;
     };
     let needs = if unordered {
         uses::BUFFER | uses::TYPED_UNORDERED_ACCESS
@@ -1321,7 +1327,7 @@ mod tests {
             (11, 12), // RGBA16 UNORM as UINT
             (42, 43), // R32 UINT as SINT
             (56, 57), // R16 UNORM as UINT
-            (61, 65), // R8 UNORM as A8
+            (61, 62), // R8 UNORM as UINT
         ] {
             assert!(castable(own, view), "{own} as {view}");
         }
@@ -1334,6 +1340,8 @@ mod tests {
             (54, 56), // R16 FLOAT as UNORM
             (87, 88), // two families
             (28, 87),
+            (61, 65), // A8_UNORM appartient à sa propre famille DXGI.
+            (65, 61),
             (41, 40), // R32 FLOAT as depth
             (45, 46), // depth with stencil
             (95, 96), // BC6H
@@ -1405,7 +1413,10 @@ mod tests {
         assert_eq!(buffer_format_with(&Host, 190, false), 60);
         // Formats outside the table, as before.
         assert_eq!(buffer_format_with(&Host, 28, false), 28);
-        assert_eq!(buffer_format_with(&Host, 118, false), 45);
+        for title in 118..=120 {
+            assert_eq!(buffer_format_with(&Host, title, false), 0);
+            assert_eq!(buffer_format_with(&Host, title, true), 0);
+        }
         for format in [53, 39, 60] {
             assert_eq!(super::super::family(format), format, "{format} is typeless");
         }

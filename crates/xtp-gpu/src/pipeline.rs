@@ -234,6 +234,10 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    #[cfg(windows)]
+    builder: bool,
+    #[cfg(windows)]
+    missing_targets: OnceLock<Box<[OnceLock<Arc<make::Pending>>]>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -284,6 +288,47 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+#[cfg(windows)]
+pub(crate) fn graphics_pipeline<'a>(this: This, missing: u8) -> Option<&'a host::HostPipeline> {
+    if missing == 0 || this.is_null() {
+        return host_pipeline(this);
+    }
+    make::ready(graphics_pending(pipeline(this), missing)?)
+}
+
+#[cfg(windows)]
+fn graphics_pending(p: &Pipeline, missing: u8) -> Option<&Arc<make::Pending>> {
+    let g = p.host.graphics.as_deref()?;
+    let mask = missing & g.typed_slots();
+    if mask == 0 {
+        return Some(&p.host);
+    }
+    // Le tas de variantes n’existe que si le titre laisse un trou dans
+    // des sorties typées. Chaque combinaison garde sa clé et sa compilation.
+    let variants = p
+        .missing_targets
+        .get_or_init(|| (0..256).map(|_| OnceLock::new()).collect());
+    let variant = variants[usize::from(mask)].get_or_init(|| {
+        Arc::new(make::Pending::new(
+            p.shaders.clone(),
+            Some(Box::new(g.without_targets(mask))),
+            None,
+        ))
+    });
+    Some(variant)
+}
+
+#[cfg(windows)]
+pub(crate) fn null_target_view(
+    this: This,
+    slot: usize,
+) -> Option<(windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, bool)> {
+    if this.is_null() {
+        return None;
+    }
+    pipeline(this).host.graphics.as_ref()?.null_view(slot)
 }
 
 /// The compute program of a title pipeline, made or not (`None` for a null
@@ -348,12 +393,17 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
+    HASHES.get_or_init(|| {
         let value = std::env::var("XTP_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
-    });
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    let hashes = skip_hashes();
     if hashes.is_empty() {
         return None;
     }
@@ -458,14 +508,18 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = {
+    let member = builder::member(&shaders);
+    #[cfg(windows)]
+    let builder = member.is_some();
+    #[cfg(windows)]
+    let host = member.unwrap_or_else(|| {
         let (graphics, stream) = graphics.unzip();
         Arc::new(make::Pending::new(
             shaders.clone(),
             graphics,
             stream.flatten(),
         ))
-    };
+    });
     #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {
@@ -473,6 +527,10 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        builder,
+        #[cfg(windows)]
+        missing_targets: OnceLock::new(),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -647,6 +705,15 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(windows)]
+mod builder;
+pub mod effects;
+#[cfg(windows)]
+pub use builder::register_builder;
+#[cfg(windows)]
+pub(crate) fn builder_held(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder && !builder::admitted()
+}
+#[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
 mod library;
@@ -668,6 +735,28 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_graphics_pipeline(
+    shaders: Vec<Arc<Shader>>,
+    graphics: host::GraphicsState,
+    masks: &[u8],
+) -> This {
+    let mut title = std::ptr::null();
+    assert_eq!(
+        hand_out(
+            shaders,
+            Some((Box::new(graphics), None)),
+            &PIPELINE_IIDS[0],
+            &mut title
+        ),
+        object::S_OK
+    );
+    for &mask in masks {
+        graphics_pending(pipeline(title), mask).unwrap().make(|| {});
+    }
+    title
 }
 
 #[cfg(all(test, windows))]

@@ -42,6 +42,31 @@ fn adapter(value: Option<&str>) -> Option<Result<bool, String>> {
     })
 }
 
+// Les signatures du traducteur indexent directement les deux tas.
+pub(crate) fn bind_indexed_heaps(host: &Host, list: &HostList) {
+    let heaps = [
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+    ]
+    .map(|ty| {
+        // SAFETY: un descripteur suffit, les shaders de la sonde ne le lisent pas.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: ty,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+        }
+        .unwrap();
+        list.keep(&heap);
+        Some(heap)
+    });
+    // SAFETY: les deux tas sont visibles et retenus par la liste.
+    unsafe { list.list.SetDescriptorHeaps(&heaps) };
+}
+
 /// The host device for the test named `test`, or `None` once the skip is
 /// reported (see the module). Keep it until the test ends: then the test
 /// fails on the debug layer's errors (see [`Gpu`]).

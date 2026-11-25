@@ -17,7 +17,8 @@
 //! diagnostics builds for each frame `XTP_CAPTURE_FRAMES` or
 //! `XTP_CAPTURE_WORLD` lists, one line gives the frame's drops by role,
 //! whether the stand-in ran and the A/B arm the frame ran in. With the
-//! stand-in off that is all a drop costs: two atomic additions.
+//! stand-in off that is all a drop costs: an addition under a lock, which
+//! the frame's first drop also takes to end the frame before.
 //!
 //! **Stand-in** (`XTP_RT_STANDIN`, every build): `1` clears what a dropped
 //! trace would have written to its "every ray missed" value ([`Fill`]),
@@ -29,7 +30,10 @@
 //! only if the dispatch would have run a group ([`Work`]): a direct one
 //! with no zero count, an indirect one under a GPU predicate on the
 //! count of its commands that run a group, as the host's rewrite of its
-//! arguments leaves it. A texture the title placed in memory itself is
+//! arguments leaves it; under that predicate a texture whose writes the
+//! list tracks (a depth texture's colour twin, a host copy) is not
+//! cleared, since the list would mark it written before the GPU knows the
+//! count ([`tracked_write`]). A texture the title placed in memory itself is
 //! cleared through the resource made for that memory, which its shader
 //! views read. With the stand-in on, the first time a program is dropped
 //! with an output, the output is logged ("rt: dropped trace"): a texture's
@@ -337,26 +341,53 @@ pub(crate) const REPORT_EVERY: u64 = 256;
 /// Outputs logged at most (first drops).
 const LOGGED_AT_MOST: usize = 256;
 
-/// The frame being counted, the A/B arm it ran in (`ab::Arm::of`'s index,
-/// taken at its first drop), and its drops (by role), clears and clears
-/// the host refused.
+/// The frame being counted: its number (`u64::MAX` before the first drop),
+/// the A/B arm it ran in (taken at its first drop), its drops by role and
+/// its clears.
+#[derive(Debug)]
+struct Tally {
+    frame: u64,
+    arm: ab::Arm,
+    drops: [u64; 7],
+    cleared: u64,
+}
+
+impl Tally {
+    const fn new(frame: u64, arm: ab::Arm) -> Self {
+        Tally {
+            frame,
+            arm,
+            drops: [0; 7],
+            cleared: 0,
+        }
+    }
+}
+
+/// The frame being counted, under one lock: lists are recorded on many
+/// threads, and the first drop of a frame must end the frame before and
+/// start its own in one step, or a drop of the new frame on another thread
+/// could be counted in the frame that ends. Then the clears the host
+/// refused, over the run.
 struct Counts {
-    frame: AtomicU64,
-    arm: AtomicU64,
-    drops: [AtomicU64; 7],
-    cleared: AtomicU64,
+    tally: Mutex<Tally>,
     failed: AtomicU64,
 }
 
 impl Counts {
     const fn new() -> Self {
         Counts {
-            frame: AtomicU64::new(u64::MAX),
-            arm: AtomicU64::new(0),
-            drops: [const { AtomicU64::new(0) }; 7],
-            cleared: AtomicU64::new(0),
+            tally: Mutex::new(Tally::new(u64::MAX, ab::Arm::A)),
             failed: AtomicU64::new(0),
         }
+    }
+
+    fn tally(&self) -> std::sync::MutexGuard<'_, Tally> {
+        self.tally.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A clear recorded, in the frame being counted.
+    fn cleared(&self) {
+        self.tally().cleared += 1;
     }
 }
 
@@ -467,7 +498,7 @@ pub(crate) fn dropped(
         match cleared {
             Ok(()) => {
                 heaps = true;
-                COUNTS.cleared.fetch_add(1, Ordering::Relaxed);
+                COUNTS.cleared();
             }
             Err(why) => {
                 let n_failed = COUNTS.failed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -491,11 +522,6 @@ pub(crate) fn dropped(
     heaps
 }
 
-/// The arm's index for [`Counts::arm`].
-fn arm_index(arm: ab::Arm) -> u64 {
-    u64::from(arm.on())
-}
-
 /// A frame's counts, once the next frame's first drop ended it.
 #[derive(Debug, PartialEq)]
 struct Ended {
@@ -512,24 +538,20 @@ impl Counts {
     /// arm taken at its own first drop (the arm changes at the present
     /// that ends a phase, before the next frame's first drop).
     fn count(&self, frame: u64, role: Role, arm: ab::Arm) -> Option<Ended> {
-        let last = self.frame.swap(frame, Ordering::Relaxed);
+        let mut tally = self.tally();
         let mut ended = None;
-        if last != frame {
-            let last_arm = ab::Arm::of(self.arm.swap(arm_index(arm), Ordering::Relaxed));
-            if last != u64::MAX {
+        if tally.frame != frame {
+            let last = std::mem::replace(&mut *tally, Tally::new(frame, arm));
+            if last.frame != u64::MAX {
                 ended = Some(Ended {
-                    frame: last,
-                    arm: last_arm,
-                    drops: self
-                        .drops
-                        .iter()
-                        .map(|d| d.swap(0, Ordering::Relaxed))
-                        .collect(),
-                    cleared: self.cleared.swap(0, Ordering::Relaxed),
+                    frame: last.frame,
+                    arm: last.arm,
+                    drops: last.drops.to_vec(),
+                    cleared: last.cleared,
                 });
             }
         }
-        self.drops[role.index()].fetch_add(1, Ordering::Relaxed);
+        tally.drops[role.index()] += 1;
         ended
     }
 }
@@ -848,12 +870,27 @@ fn end_predicate(list: &HostList, words: &ID3D12Resource) {
     };
 }
 
+/// Whether a clear of `view` is refused because the list would track its
+/// write before the GPU says whether it runs: under a GPU count
+/// (`predicated`), an unordered access view of a resource (a texture, or a
+/// buffer range without a shadow, `shadowed`). Recording such a clear
+/// marks a depth texture's colour twin ahead of the depth texture
+/// (`HostList::twins_written`) and the resource's host copy written on the
+/// GPU (`texture::gpu_write`), so a dispatch whose count is 0 would leave
+/// it marked written by nothing. A shadowed buffer range is refreshed just
+/// before its clear, so what goes back to title memory is right whether
+/// the clear runs or not; a placed texture tracks no write.
+fn tracked_write(view: &View, shadowed: bool, predicated: bool) -> bool {
+    predicated && !shadowed && matches!(view, View::Unordered(..))
+}
+
 /// Clears `view` to `fill` in `list`, where the dropped dispatch would have
 /// run: a texture's host copy, or a buffer range's host copy (which goes
 /// back to title memory after the submission, as shader writes do). Under
 /// `predicate` (a word and its offset, [`predicate_word`]), the clear
-/// itself runs only if the word is not 0. Sets XTP's own view heap on the
-/// list. Why not if it cannot.
+/// itself runs only if the word is not 0, and a texture whose writes the
+/// list tracks is refused ([`tracked_write`]). Sets XTP's own view heap on
+/// the list. Why not if it cannot.
 fn clear(
     list: &HostList,
     view: &View,
@@ -867,6 +904,12 @@ fn clear(
         _ => return Err("not an unordered access view"),
     };
     let range = crate::descriptor::host::buffer_range(view);
+    let shadow = range
+        .filter(|&(_, len)| len > 0)
+        .and_then(|(address, len)| Some((crate::shadow::find(address, len)?, address, len)));
+    if tracked_write(view, shadow.is_some(), predicate.is_some()) {
+        return Err("under a GPU count, a view whose write the list would track before the count");
+    }
     // A raw or structured buffer view (a stride, or the raw flag) has no
     // format to clear in floats.
     let untyped = words.is_some_and(|w| w[5] != 0 || w[8] & 1 != 0);
@@ -886,10 +929,7 @@ fn clear(
     if !heap.make_at(slot, view) {
         return Err("the host cannot place the view in its heap");
     }
-    if let Some((address, len)) = range
-        && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
-    {
+    if let Some((shadow, address, len)) = shadow {
         shadow.refresh(list, address, len);
         shadow.gpu_writes(list, address, len);
     } else if let View::Unordered(texture, _, _) = view {
@@ -1061,7 +1101,7 @@ mod tests {
         // The first drop ever ends no frame.
         assert_eq!(counts.count(10, Role::ProbeGather, Arm::A), None);
         assert_eq!(counts.count(10, Role::ProbeGather, Arm::A), None);
-        counts.cleared.fetch_add(1, Ordering::Relaxed);
+        counts.cleared();
         // The phase changed at the present after frame 10: frame 10 is
         // reported in A, the arm it ran in, not B.
         let ended = counts.count(11, Role::Particles, Arm::B).unwrap();
@@ -1074,6 +1114,59 @@ mod tests {
         assert_eq!((ended.frame, ended.arm), (11, Arm::B));
         assert_eq!(ended.drops[Role::Particles.index()], 1);
         assert_eq!(ended.cleared, 0);
+    }
+
+    #[test]
+    fn rt_standin_counts_each_drop_of_a_frame_in_that_frame_across_threads() {
+        use ab::Arm;
+        const THREADS: u64 = 8;
+        const DROPS: u64 = 2000;
+        let counts = Counts::new();
+        assert_eq!(counts.count(1, Role::Particles, Arm::A), None);
+        // Threads recording frame 2 at once: one of them ends frame 1, and
+        // every drop of frame 2 is counted in frame 2, none in frame 1.
+        let ended: Vec<Ended> = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    s.spawn(|| {
+                        (0..DROPS)
+                            .filter_map(|_| counts.count(2, Role::ProbeGather, Arm::B))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|t| t.join().unwrap())
+                .collect()
+        });
+        assert_eq!(ended.len(), 1);
+        assert_eq!((ended[0].frame, ended[0].arm), (1, Arm::A));
+        assert_eq!(ended[0].drops.iter().sum::<u64>(), 1);
+        let ended = counts.count(3, Role::Particles, Arm::B).unwrap();
+        assert_eq!((ended.frame, ended.arm), (2, Arm::B));
+        assert_eq!(ended.drops[Role::ProbeGather.index()], THREADS * DROPS);
+        assert_eq!(ended.drops.iter().sum::<u64>(), THREADS * DROPS);
+    }
+
+    #[test]
+    fn rt_standin_refuses_a_tracked_texture_write_under_a_gpu_count() {
+        let texture = View::Unordered(0, 0, None);
+        // Under a GPU count, a texture's view would be marked written
+        // before the count is known: refused.
+        assert!(tracked_write(&texture, false, true));
+        // Without one the clear runs whenever it is recorded.
+        assert!(!tracked_write(&texture, false, false));
+        // A buffer range with a shadow tracks no texture write.
+        assert!(!tracked_write(&texture, true, true));
+        // Nor does a placed view.
+        let mut resource = [0u32; 14];
+        resource[0] = 3;
+        assert!(!tracked_write(
+            &View::Placed(true, resource, [0; 16]),
+            false,
+            true
+        ));
     }
 
     #[test]

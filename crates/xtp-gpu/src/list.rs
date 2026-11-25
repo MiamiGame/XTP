@@ -153,6 +153,14 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = query_list(this)?;
+    // Une commande suivante (fermeture comprise) doit voir les résultats.
+    list.query_resolves.flush(list);
+    Some(list)
+}
+
+#[cfg(windows)]
+fn query_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -988,6 +996,17 @@ fn clear_uav(
             warn_once!("a UAV clear of a slot without a view of ours: not done");
             return;
         };
+        // Résoudre la texture une seule fois pour les deux descripteurs,
+        // la transition d'état et le suivi de son écriture.
+        let view = match view {
+            View::Placed(true, ref resource, _) if resource[0] != 1 => {
+                let Some(texture) = crate::descriptor::host::placed_texture(&view) else {
+                    return;
+                };
+                texture
+            }
+            view => view,
+        };
         let words: Option<&[u32]> = match &view {
             View::Unordered(_, _, desc) => desc.as_ref().map(|d| &d[..]),
             View::Placed(true, _, desc) => Some(&desc[..10]),
@@ -1471,10 +1490,9 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// - So the flags are taken as that register, and bit 5
 ///   ([`USE_THREAD_DIMENSIONS`]) makes the counts threads. Without bit 1
 ///   the command processor runs whole groups, the last one rounded up (radv
-///   dispatches rays that way and lets its shaders check their bounds):
-///   what the host runs too, so no thread needs masking. A dispatch with
-///   bit 1 is logged ([`PARTIAL_GROUPS`]): there the host runs threads the
-///   console would not.
+///   dispatches rays that way and lets its shaders check their bounds).
+///   Pour le constructeur, les tailles en threads sont aussi transmises au
+///   shader : il masque les lanes de queue, comme dans le fork (#646).
 ///
 /// `XTP_DISPATCH_X_THREADS` sets other bits (`0` for none: every count is
 /// a group count, as before).
@@ -1482,20 +1500,29 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
     {
         let pipeline = kept_pipeline(this);
-        let host = crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute);
+        // Une image en attente ignore aussi la conversion des dimensions.
+        let host = if crate::pipeline::builder_held(pipeline) {
+            None
+        } else {
+            crate::pipeline::host_pipeline(pipeline).filter(|p| p.compute)
+        };
         let group = host.and_then(console_group);
         let threads = thread_count_flags();
         if flags & threads != 0 && flags & PARTIAL_GROUPS != 0 {
             warn_once!(
                 flags = format_args!("{flags:#x}"),
-                "DispatchX with partial groups: the host runs the last group of each dimension \
-                 whole, threads the console would not run"
+                "DispatchX with partial groups: the host rounds the group counts up; spilled compute shaders mask the final lanes"
             );
         }
         let groups = dispatch_x_groups([x, y, z], flags, threads, group);
         note_dispatch_x(pipeline, host, ([x, y, z], flags), group, groups);
-        let [x, y, z] = groups;
-        state::dispatch(this, x, y, z);
+        let limits = if flags & threads != 0 {
+            [x, y, z]
+        } else {
+            [0; 3]
+        };
+        count_dispatch();
+        with_state(this, |list, s| s.dispatch(list, groups, limits));
     }
     #[cfg(not(windows))]
     {
@@ -1619,19 +1646,10 @@ fn note_dispatch_x(
 
 extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
     #[cfg(windows)]
-    if let (Some(list), Some(heap)) = (
-        host_list(this),
-        crate::query::host_heap(heap, kind, index, 1),
-    ) {
-        list.keep(heap);
-        // SAFETY: a matching heap and in-range slot retained by this list.
-        unsafe {
-            list.list.BeginQuery(
-                heap,
-                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
-                index,
-            )
-        };
+    if let Some(heap) = crate::query::host_heap(heap, kind, index, 1) {
+        with_state(this, |list, state| {
+            heap.begin(list, &mut state.occlusion, kind, index)
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, heap, kind, index);
@@ -1639,19 +1657,10 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
 
 extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
     #[cfg(windows)]
-    if let (Some(list), Some(heap)) = (
-        host_list(this),
-        crate::query::host_heap(heap, kind, index, 1),
-    ) {
-        list.keep(heap);
-        // SAFETY: as in begin_query.
-        unsafe {
-            list.list.EndQuery(
-                heap,
-                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
-                index,
-            )
-        };
+    if let Some(heap) = crate::query::host_heap(heap, kind, index, 1) {
+        with_state(this, |list, state| {
+            heap.end(list, &mut state.occlusion, kind, index)
+        });
     }
     #[cfg(not(windows))]
     let _ = (this, heap, kind, index);
@@ -1702,35 +1711,16 @@ extern "system" fn resolve_queries(
     }
     #[cfg(windows)]
     if let (Some(list), Some(heap)) = (
-        host_list(this),
+        query_list(this),
         crate::query::host_heap(_heap, kind, _first, count),
     ) && offset.is_multiple_of(8)
         && let Some(at) = (data as u64).checked_add(offset)
         && let Some(dst) = crate::shadow::find(at, u64::from(count) * bytes)
         && dst.offset(at).is_multiple_of(8)
     {
-        use windows::Win32::Graphics::Direct3D12::*;
-        list.keep(heap);
         dst.gpu_copies(list, at, u64::from(count) * bytes);
-        let common = D3D12_RESOURCE_STATE_COMMON;
-        let copy = D3D12_RESOURCE_STATE_COPY_DEST;
-        // SAFETY: the list keeps both resources and the whole range was checked.
-        unsafe {
-            list.list.ResourceBarrier(&[
-                crate::host::uav_barrier(),
-                crate::host::transition(&dst.buffer, common, copy),
-            ]);
-            list.list.ResolveQueryData(
-                heap,
-                D3D12_QUERY_TYPE(kind as i32),
-                _first,
-                count,
-                &dst.buffer,
-                dst.offset(at),
-            );
-            list.list
-                .ResourceBarrier(&[crate::host::transition(&dst.buffer, copy, common)]);
-        }
+        list.query_resolves
+            .push(list, heap, _first, count, &dst.buffer, dst.offset(at));
         return;
     }
     for i in 0..u64::from(count) {
@@ -1988,10 +1978,9 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch(list, [x, y, z], [0; 3]));
     }
-    /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
-    /// programs take `x` groups only.
+    /// Le GPU hôte exécute la grille XYZ sur un axe, celui que lit MeshGroup.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
         with_state(this, |list, s| s.dispatch_mesh(list, [x, y, z]));
@@ -2009,6 +1998,7 @@ mod state {
         super::count_draw();
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
+            with_state(this, |_, s| s.occlusion.dropped_draw());
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
@@ -2122,6 +2112,10 @@ extern "system" fn execute_indirect(
     if ran {
         return;
     }
+    #[cfg(windows)]
+    if max != 0 && args.iter().any(|arg| matches!(arg[0], 0 | 1 | 10)) {
+        with_state(this, |_, s| s.occlusion.dropped_draw());
+    }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -2152,6 +2146,7 @@ pub(crate) mod cuts {
     pub(crate) static GROWTH: AtomicU64 = AtomicU64::new(0);
     pub(crate) static MISSING_TARGET: AtomicU64 = AtomicU64::new(0);
     pub(crate) static SHIFTED_TARGET: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static VISIBLE: AtomicU64 = AtomicU64::new(0);
     pub(super) static OCCLUSION: AtomicU64 = AtomicU64::new(0);
     pub(super) static STATS: AtomicU64 = AtomicU64::new(0);
     pub(super) static DEPTH_ORDER: AtomicU64 = AtomicU64::new(0);
@@ -2167,6 +2162,7 @@ pub(crate) mod cuts {
             scratch_growth = GROWTH.load(Relaxed),
             missing_rtv = MISSING_TARGET.load(Relaxed),
             rtv_after_hole = SHIFTED_TARGET.load(Relaxed),
+            occlusion_forced_visible = VISIBLE.load(Relaxed),
             occlusion_results = OCCLUSION.load(Relaxed),
             statistics_results = STATS.load(Relaxed),
             depth_order = DEPTH_ORDER.load(Relaxed),
@@ -2773,6 +2769,43 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn a_placed_texture_clear_updates_the_same_host_copy_as_its_view() {
+            let Some(gpu) = device("list::tests::gpu::placed_texture_clear") else {
+                return;
+            };
+            let memory = crate::resource::Memory::zeroed(65536, 65536).unwrap();
+            let address = memory.address();
+            let desc = crate::resource::tests_support::target(4, 4, 28);
+            // SAFETY: ResourceDesc contient les quatorze mots du descripteur console.
+            let mut resource: [u32; 14] = unsafe { std::mem::transmute_copy(&desc) };
+            resource[12] = 4;
+            let mut view = [0; 16];
+            view[..2].copy_from_slice(&[28, 4]);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            let heap = crate::descriptor::TestHeap::views(4);
+            let handle = crate::descriptor::heap(heap.0).start;
+            crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &view, handle);
+            let list = TitleList::new();
+            clear_uav_uint(
+                list.this(),
+                handle,
+                handle,
+                std::ptr::null(),
+                &[1, 2, 3, 4],
+                0,
+                std::ptr::null(),
+            );
+            list.run();
+            let object = crate::resource::texture_at(address, &resource).unwrap();
+            let texture = crate::resource::host_resource(object).unwrap();
+            let texels =
+                crate::resource::tests_support::read_back(gpu.host(), texture, UNORDERED_ACCESS);
+            assert_eq!(&texels[..4], &[1, 2, 3, 4]);
+            drop(heap);
+            crate::resource::memory_remapped(address as usize, 65536);
         }
 
         /// A buffer view's integer clear writes its range of the host copy,

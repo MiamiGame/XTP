@@ -12,6 +12,19 @@ the changes made for XTP is in this repository's git log.
 Third-party code carried over from VIctory keeps its own copyright notices
 and licences, stated at the top of the files concerned.
 
+## Constructeur de structures d'accélération
+
+- Paramètres racine déportés d'après Marvisak/VIctory (`27c3dc9d5`),
+  fxceless's VIctory fork (`578d459`) et les tests de louketa dans
+  Marvisak/VIctory#489 (`fe7210e`).
+- Vues UAV racine d'après DuarttBR dans Marvisak/VIctory#1077
+  (`873548f`). Accès par demi-mot d'après iurysf dans Marvisak/VIctory#1572
+  (`0c16661`) et fxceless's VIctory fork (`4e17478`).
+- Dimensions en threads et masque de fin de groupe d'après Yorivel
+  (`2521646b8`) et mynzjerko (#646, `170c24269`) dans fxceless's VIctory fork.
+- Admission du constructeur entier d'après 0xkn0wh3r3 dans
+  Marvisak/VIctory#2118 (`60632d3f`, GPL-3.0).
+
 ## References that are not copied
 
 The following projects are studied as references only. **No code is copied

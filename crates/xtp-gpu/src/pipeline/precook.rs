@@ -14,12 +14,16 @@
 //!   which stores it into the host pipeline library as a first dispatch
 //!   does; [`finish`] saves the library.
 //! - Graphics and mesh pipelines need the title's graphics state as well,
-//!   which only a session sees: sessions keep each one's description
-//!   ([`super::record`]), and [`replay`] makes it again as the session
-//!   did, by the same function with the same shaders and state, into the
-//!   same library entry. A description whose shaders do not translate any
-//!   more is refused at once, as in a session. The file of descriptions is
-//!   rewritten here once it grows past its bound (`record::compact`).
+//!   which only a session sees: sessions keep the description of each one
+//!   the title creates ([`super::record`]), and [`replay`] makes it again as
+//!   the session did, by the same function with the same shaders and state,
+//!   into the same library entry. A description whose shaders do not
+//!   translate any more is refused at once, as in a session. The file of
+//!   descriptions is rewritten here once it grows past its bound
+//!   (`record::compact`).
+//! - The pack's effects ([`super::effects`]) name the shaders of each pass,
+//!   not its state: their shader sets ([`ShaderSet`]) say how much of the
+//!   title the kept descriptions cover ([`Recorded::shader_sets`]).
 //! - What a whole pass depends on besides the pack and the translator, for
 //!   the precook's note: the kept descriptions and the library file
 //!   ([`cache`]).
@@ -199,6 +203,8 @@ pub fn rebuild_library() -> bool {
 /// once, ready to make again ([`replay`]).
 pub struct Recorded {
     pipelines: Vec<Description>,
+    /// The shader sets of the descriptions that read back, each once.
+    pub shader_sets: HashSet<ShaderSet>,
     /// Kept descriptions that are not made again: the entries that do not
     /// read back, those whose state does not decode, those whose
     /// containers are not kept, and repeats (descriptions this build reads
@@ -206,6 +212,13 @@ pub struct Recorded {
     pub damaged: usize,
     pub missing: usize,
     pub repeated: usize,
+    /// Of those made again, the pipelines a session drew with (the early
+    /// list's): they come first.
+    pub drawn: usize,
+    /// After the kept ones, those [`derive`] added: they come last.
+    pub derived: usize,
+    /// The early keys of those made again, each once.
+    keys: HashSet<String>,
     /// The file's size, and where it is (none without a pipeline cache).
     pub bytes: u64,
     pub path: Option<std::path::PathBuf>,
@@ -228,6 +241,21 @@ pub struct Recorded {
 struct Description {
     shaders: Vec<Arc<Shader>>,
     state: GraphicsState,
+    /// The stream it was read from, and its shaders' containers' BLAKE3.
+    stream: super::record::Stream,
+    hashes: Vec<[u8; 32]>,
+}
+
+/// A pipeline's shader set: its containers' BLAKE3, in order, whatever
+/// their stages (the pack's effects put a mesh program in the vertex
+/// list).
+pub type ShaderSet = Vec<[u8; 32]>;
+
+/// The shader set of `containers`.
+pub fn shader_set<'a>(containers: impl IntoIterator<Item = &'a [u8; 32]>) -> ShaderSet {
+    let mut set: ShaderSet = containers.into_iter().copied().collect();
+    set.sort_unstable();
+    set
 }
 
 // SAFETY: the graphics state's input elements point into its own names,
@@ -260,9 +288,13 @@ impl Recorded {
     fn none() -> Recorded {
         Recorded {
             pipelines: Vec::new(),
+            shader_sets: HashSet::new(),
             damaged: 0,
             missing: 0,
             repeated: 0,
+            drawn: 0,
+            derived: 0,
+            keys: HashSet::new(),
             bytes: 0,
             path: None,
             digest: "none".into(),
@@ -275,7 +307,9 @@ impl Recorded {
 
 /// [`recorded`] of the file in `dir`, rewritten first down to `to` bytes
 /// if it is larger than `at` (or started again if it is of an earlier
-/// version), unless another process has it open.
+/// version), unless another process has it open. The pipelines a session
+/// drew with come first: a session keeps every pipeline the title creates
+/// (some 80,000), and draws with a few thousand of them.
 fn recorded_in(dir: &std::path::Path, at: u64, to: u64) -> Result<Recorded, String> {
     let mut out = Recorded::none();
     let mut file = super::record::read(dir)?;
@@ -310,8 +344,10 @@ fn recorded_in(dir: &std::path::Path, at: u64, to: u64) -> Result<Recorded, Stri
     out.bytes = file.bytes;
     out.digest = file.digest.clone();
     out.damaged = file.damaged;
-    let mut seen = HashSet::new();
+    let mut others = Vec::new();
     for kept in &file.pipelines {
+        out.shader_sets
+            .insert(shader_set(kept.shaders.iter().map(|(_, hash)| hash)));
         let Some(state) = kept.stream.state() else {
             out.damaged += 1;
             continue;
@@ -325,13 +361,249 @@ fn recorded_in(dir: &std::path::Path, at: u64, to: u64) -> Result<Recorded, Stri
             out.missing += 1;
             continue;
         };
-        if !seen.insert(super::make::key(&shaders, Some(&state))) {
+        let key = super::make::key(&shaders, Some(&state));
+        if !out.keys.insert(key.clone()) {
             out.repeated += 1;
             continue;
         }
-        out.pipelines.push(Description { shaders, state });
+        let d = Description {
+            shaders,
+            state,
+            stream: kept.stream.clone(),
+            hashes: kept.shaders.iter().map(|&(_, hash)| hash).collect(),
+        };
+        if super::library::wanted_early(&key) {
+            out.pipelines.push(d);
+        } else {
+            others.push(d);
+        }
     }
+    out.drawn = out.pipelines.len();
+    out.pipelines.extend(others);
     Ok(out)
+}
+
+/// What [`derive`] found and added.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Derived {
+    /// The shader sets of the pack's passes that draw, and of them those the
+    /// kept descriptions have.
+    pub sets: usize,
+    pub covered: usize,
+    /// The kept descriptions' shader sets that no pass names.
+    pub other: usize,
+    /// The sets no kept description has that got derived descriptions, and
+    /// how many.
+    pub derived_sets: usize,
+    pub descriptions: usize,
+}
+
+/// How many of a mesh pass's state bytes [`derive`] compares, tier after
+/// tier: ten, six, then none (its technique's name alone).
+const TIERS: [usize; 3] = [10, 6, 0];
+
+/// Kept descriptions (their indices) by a pass's technique name and state
+/// bytes.
+type ByPass<'a> = std::collections::HashMap<(&'a str, &'a [u8]), Vec<usize>>;
+
+/// A derived pipeline's shaders, and their containers' BLAKE3.
+type Shaders = (Vec<Arc<Shader>>, Vec<[u8; 32]>);
+
+/// Adds to `recorded`, after the kept descriptions, descriptions derived for
+/// the passes of the pack's `effects` whose shader set no kept description
+/// has (an effect the session did not load: another place's materials, the
+/// interface's): the pass's shaders, each with a graphics state kept for
+/// passes like it. The pack gives a pass's shaders but not its state, which
+/// the title overrides at creation; the kept descriptions give the states
+/// the title makes, its targets, depth and vertex formats:
+///
+/// - a mesh pass takes the states of the kept passes of the same technique
+///   (by name, in any effect) with the same state bytes: the first ten,
+///   else the first six, else any. Tried on the 9,830 mesh shader sets a
+///   Series S session to the world kept (2026-11-25), each predicted from
+///   the others, this gave 96 % of their 24,644 descriptions, among 34,404
+///   tries (69 % of them right);
+/// - a vertex pass takes the states its vertex program was kept with (its
+///   input layout is its own): 84 % of the 55,875 descriptions of the 2,323
+///   vertex shader sets, among 47,556 tries (98 % right);
+/// - a pass with a program of another list (geometry: the title made none)
+///   gets none.
+///
+/// `container` gives the container of a record of the pack. The same
+/// shaders with the same state are added once, and not again if kept.
+/// Without `add`, nothing is added: the sets are counted alone.
+pub fn derive(
+    recorded: &mut Recorded,
+    effects: &super::effects::Effects,
+    add: bool,
+    container: impl Fn(usize) -> Option<Vec<u8>>,
+) -> Derived {
+    derive_with(recorded, effects, add, container, |code| {
+        stage(code) == Some(HwStage::Ms)
+    })
+}
+
+/// [`derive`], whose vertex list's programs are mesh ones as `mesh` says.
+fn derive_with(
+    recorded: &mut Recorded,
+    effects: &super::effects::Effects,
+    add: bool,
+    container: impl Fn(usize) -> Option<Vec<u8>>,
+    mesh: impl Fn(&[u8]) -> bool,
+) -> Derived {
+    use super::effects::{COMPUTE, PIXEL, VERTEX};
+    use std::collections::{BTreeMap, HashMap};
+    let mut technique = vec![""; effects.passes.len()];
+    for e in &effects.effects {
+        for t in &e.techniques {
+            for i in t.passes.clone() {
+                technique[i] = &t.name;
+            }
+        }
+    }
+    // Each program's container BLAKE3, by record; each drawing pass's set.
+    let mut hashes: HashMap<usize, Option<[u8; 32]>> = HashMap::new();
+    let mut hash = |i: usize| {
+        *hashes
+            .entry(i)
+            .or_insert_with(|| container(i).map(|c| *blake3::hash(&c).as_bytes()))
+    };
+    let mut set_passes: BTreeMap<ShaderSet, Vec<usize>> = BTreeMap::new();
+    for (i, p) in effects.passes.iter().enumerate().filter(|(_, p)| p.draws()) {
+        let programs = p
+            .programs
+            .iter()
+            .enumerate()
+            .filter(|&(list, _)| list != COMPUTE)
+            .filter_map(|(_, r)| *r)
+            .map(&mut hash)
+            .collect::<Option<Vec<_>>>();
+        if let Some(programs) = programs {
+            set_passes.entry(shader_set(&programs)).or_default().push(i);
+        }
+    }
+    let mut out = Derived {
+        sets: set_passes.len(),
+        covered: set_passes
+            .keys()
+            .filter(|s| recorded.shader_sets.contains(*s))
+            .count(),
+        other: recorded
+            .shader_sets
+            .iter()
+            .filter(|s| !set_passes.contains_key(*s))
+            .count(),
+        ..Derived::default()
+    };
+    // The kept descriptions by vertex program, and the mesh ones by their
+    // passes' technique and state bytes, tier by tier.
+    // Each by the first kept description of its stream: thousands share a
+    // few states, and a state is tried once.
+    let mut by_vertex: HashMap<[u8; 32], Vec<usize>> = HashMap::new();
+    let mut by_pass: [ByPass; TIERS.len()] = Default::default();
+    let mut first: HashMap<&[u8], usize> = HashMap::new();
+    for (d, desc) in recorded.pipelines.iter().enumerate() {
+        let d = *first.entry(desc.stream.bytes()).or_insert(d);
+        match desc.shaders.first().map(|s| s.stage) {
+            Some("vertex") => by_vertex.entry(desc.hashes[0]).or_default().push(d),
+            Some("mesh") => {
+                for &p in set_passes
+                    .get(&shader_set(&desc.hashes))
+                    .into_iter()
+                    .flatten()
+                {
+                    for (&n, pool) in TIERS.iter().zip(&mut by_pass) {
+                        let key = (technique[p], &effects.passes[p].state[..n]);
+                        pool.entry(key).or_default().push(d);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for list in by_vertex
+        .values_mut()
+        .chain(by_pass.iter_mut().flat_map(HashMap::values_mut))
+    {
+        list.sort_unstable();
+        list.dedup();
+    }
+    let mut derived = Vec::new();
+    for (set, passes) in &set_passes {
+        if !add || recorded.shader_sets.contains(set) {
+            continue;
+        }
+        let mut from: Vec<usize> = Vec::new();
+        let mut shaders: Option<Shaders> = None;
+        for &p in passes {
+            let pass = &effects.passes[p];
+            let vertex = pass.programs[VERTEX].expect("a pass that draws");
+            if pass
+                .programs
+                .iter()
+                .enumerate()
+                .any(|(list, r)| r.is_some() && list != VERTEX && list != PIXEL)
+            {
+                continue;
+            }
+            let Some(code) = container(vertex) else {
+                continue;
+            };
+            let mesh = mesh(&code);
+            let found = if mesh {
+                TIERS
+                    .iter()
+                    .zip(&by_pass)
+                    .find_map(|(&n, pool)| pool.get(&(technique[p], &pass.state[..n])))
+            } else {
+                hash(vertex).and_then(|h| by_vertex.get(&h))
+            };
+            let Some(found) = found else {
+                continue;
+            };
+            from.extend(found);
+            if shaders.is_none() {
+                let mut v = vec![super::shader(if mesh { "mesh" } else { "vertex" }, &code)];
+                let mut h = vec![*blake3::hash(&code).as_bytes()];
+                if let Some(pixel) = pass.programs[PIXEL] {
+                    let Some(code) = container(pixel) else {
+                        continue;
+                    };
+                    v.push(super::shader("pixel", &code));
+                    h.push(*blake3::hash(&code).as_bytes());
+                }
+                shaders = Some((v, h));
+            }
+        }
+        let Some((shaders, hashes)) = shaders else {
+            continue;
+        };
+        from.sort_unstable();
+        from.dedup();
+        let before = derived.len();
+        for d in from {
+            let stream = &recorded.pipelines[d].stream;
+            let Some(state) = stream.state() else {
+                continue;
+            };
+            if recorded
+                .keys
+                .insert(super::make::key(&shaders, Some(&state)))
+            {
+                derived.push(Description {
+                    shaders: shaders.clone(),
+                    state,
+                    stream: stream.clone(),
+                    hashes: hashes.clone(),
+                });
+            }
+        }
+        out.derived_sets += usize::from(derived.len() > before);
+    }
+    out.descriptions = derived.len();
+    recorded.derived = derived.len();
+    recorded.pipelines.extend(derived);
+    out
 }
 
 /// What became of one kept pipeline made again.
@@ -465,6 +737,7 @@ pub(in crate::pipeline) mod tests {
                     static_samplers: vec![],
                     root_cbvs: vec![],
                     root_srvs: vec![],
+                    root_uavs: vec![],
                     stride_table: false,
                     run_time_buffers: 0,
                 },
@@ -504,6 +777,166 @@ pub(in crate::pipeline) mod tests {
         assert_eq!((r.compacted, r.len()), (Some((before, 0)), 1));
         let r = recorded_in(dir.path(), 0, 0).unwrap();
         assert_eq!((r.compacted, r.len()), (Some((before, 1)), 0));
+    }
+
+    /// A pipeline a session drew with (the early list's) is made first,
+    /// whatever its place in the file.
+    #[test]
+    fn pipelines_a_session_drew_with_come_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = |pixel: &[u8]| {
+            let shaders = vec![
+                super::super::shader("vertex", b"precook drawn: vertex"),
+                super::super::shader("pixel", pixel),
+            ];
+            let stream = super::super::record::stream_of(&[(14, words(&[3]))]);
+            assert!(super::super::record::keep_in(dir.path(), &shaders, &stream));
+            super::super::make::key(&shaders, stream.state().as_ref())
+        };
+        let first = keep(b"precook drawn: never drawn");
+        let drawn = keep(b"precook drawn: drawn");
+        super::super::library::note_used(&drawn);
+        let r = recorded_in(dir.path(), u64::MAX, u64::MAX).unwrap();
+        let keys: Vec<String> = r
+            .pipelines
+            .iter()
+            .map(|d| super::super::make::key(&d.shaders, Some(&d.state)))
+            .collect();
+        assert_eq!((r.drawn, keys), (1, vec![drawn, first]));
+    }
+
+    /// Derived descriptions: a mesh pass takes the states kept for its
+    /// technique, the closest state bytes first; a vertex pass those its
+    /// vertex program was kept with; a pass like no kept one gets none. The
+    /// sets are counted, and a derived description goes after the kept ones.
+    #[test]
+    fn descriptions_are_derived_for_the_sets_no_session_kept() {
+        use super::super::effects::{Effect, Effects, LISTS, Pass, Technique};
+        let dir = tempfile::tempdir().unwrap();
+        let code: Vec<Vec<u8>> = [
+            "mesh a", "pixel a", "vs b", "pixel b", "mesh c", "pixel c", "mesh d", "pixel d",
+            "mesh e", "pixel e",
+        ]
+        .iter()
+        .map(|n| format!("derive {n}").into_bytes())
+        .collect();
+        let stream = |topology: u32| super::super::record::stream_of(&[(14, words(&[topology]))]);
+        let keep = |stages: [&'static str; 2], records: [usize; 2], topology| {
+            let shaders: Vec<_> = stages
+                .iter()
+                .zip(records)
+                .map(|(stage, r)| super::super::shader(stage, &code[r]))
+                .collect();
+            assert!(super::super::record::keep_in(
+                dir.path(),
+                &shaders,
+                &stream(topology)
+            ));
+        };
+        keep(["mesh", "pixel"], [0, 1], 3);
+        keep(["mesh", "pixel"], [0, 1], 4);
+        keep(["vertex", "pixel"], [2, 3], 2);
+        let pass = |effect, vertex: usize, pixel: usize, state: u8| {
+            let mut programs = [None; LISTS];
+            programs[0] = Some(vertex);
+            programs[1] = Some(pixel);
+            let mut bytes = [0u8; 18];
+            bytes[8] = state;
+            Pass {
+                effect,
+                programs,
+                state: bytes,
+                outside: false,
+            }
+        };
+        let technique = |name: &str, passes| Technique {
+            name: name.into(),
+            passes,
+        };
+        let effects = Effects {
+            effects: vec![
+                Effect {
+                    name: "kept".into(),
+                    techniques: vec![technique("draw", 0..1), technique("depth", 1..2)],
+                },
+                Effect {
+                    name: "not loaded".into(),
+                    techniques: vec![
+                        technique("draw", 2..4),
+                        technique("depth", 4..5),
+                        technique("other", 5..6),
+                    ],
+                },
+            ],
+            passes: vec![
+                pass(0, 0, 1, 1),
+                pass(0, 2, 3, 0),
+                // The same technique and state bytes.
+                pass(1, 4, 5, 1),
+                // The same technique, other state bytes past the sixth.
+                pass(1, 6, 5, 2),
+                // The vertex program kept with another pixel one.
+                pass(1, 2, 7, 0),
+                // A technique no session kept.
+                pass(1, 8, 9, 1),
+            ],
+        };
+        let mut r = recorded_in(dir.path(), u64::MAX, u64::MAX).unwrap();
+        assert_eq!(r.len(), 3);
+        let d = derive_with(
+            &mut r,
+            &effects,
+            true,
+            |i| code.get(i).cloned(),
+            |c| c.starts_with(b"derive mesh"),
+        );
+        assert_eq!(
+            d,
+            Derived {
+                sets: 6,
+                covered: 2,
+                other: 0,
+                derived_sets: 3,
+                descriptions: 5,
+            }
+        );
+        assert_eq!((r.len(), r.derived), (8, 5));
+        let stages: Vec<Vec<&str>> = r.pipelines[3..]
+            .iter()
+            .map(|d| d.shaders.iter().map(|s| s.stage).collect())
+            .collect();
+        assert_eq!(
+            stages.iter().filter(|s| s[..] == ["mesh", "pixel"]).count(),
+            4
+        );
+        assert_eq!(
+            stages
+                .iter()
+                .filter(|s| s[..] == ["vertex", "pixel"])
+                .count(),
+            1
+        );
+        // Derived once: not again, and nothing without `add`.
+        let again = derive_with(
+            &mut r,
+            &effects,
+            true,
+            |i| code.get(i).cloned(),
+            |c| c.starts_with(b"derive mesh"),
+        );
+        assert_eq!((again.descriptions, r.len()), (0, 8));
+        let mut fresh = recorded_in(dir.path(), u64::MAX, u64::MAX).unwrap();
+        let counted = derive_with(
+            &mut fresh,
+            &effects,
+            false,
+            |i| code.get(i).cloned(),
+            |c| c.starts_with(b"derive mesh"),
+        );
+        assert_eq!(
+            (counted.sets, counted.covered, counted.descriptions),
+            (6, 2, 0)
+        );
     }
 
     /// The descriptions made again are those of the file as read: its

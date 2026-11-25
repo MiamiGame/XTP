@@ -60,10 +60,15 @@ impl<'a> Lower<'a> {
         if guard.is_some() && !mesh && !self.s.pixel {
             return Err("a conditional export");
         }
+        // Un done sans VM ne transmet pas EXEC. Si le masque vient d'un
+        // export antérieur, il faudrait le conserver à travers les branches.
+        if self.s.pixel && e.done && !e.vm && self.x.io.exports.iter().any(|x| x.vm && !x.done) {
+            return Err("a pixel export with a valid mask before done without a valid mask");
+        }
+        let final_mask = self.s.pixel && e.done && e.vm;
         let c = self.cur;
         if let Some(g) = guard
-            && self.s.pixel
-            && e.done
+            && final_mask
         {
             let t = self.s.m.bool(true);
             let kill = self.s.m.bin(c, Bin::Xor, g, t);
@@ -197,7 +202,7 @@ impl<'a> Lower<'a> {
         }
         // Only a pixel's final export discards inactive lanes. Earlier stores
         // are conditional and their inactive lanes may export again later.
-        let at = if !self.s.pixel || !e.done {
+        let at = if !final_mask {
             self.begin_guarded(guard)
         } else {
             None

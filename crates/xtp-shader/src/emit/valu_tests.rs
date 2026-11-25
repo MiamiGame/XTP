@@ -157,6 +157,7 @@ pub(super) fn build_valu_cs_with_mode(body: &[u32], float_mode: u8) -> HostShade
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
         stride_table: lowered.stride_table,
         run_time_buffers: lowered.run_time_buffers,
     };

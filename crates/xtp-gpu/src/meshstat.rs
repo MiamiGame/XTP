@@ -544,6 +544,7 @@ fn host_bytes(shadow: &Shadow, address: u64, n: usize) -> Option<Vec<u8>> {
 fn title_bytes(address: u64, n: usize) -> Option<Vec<u8>> {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let _pin = crate::pin_copy_back(address as usize, n);
     let mut out = vec![0u8; n];
     let mut read = 0usize;
     // SAFETY: the kernel copies into our buffer of `n` bytes, and fails

@@ -117,6 +117,7 @@ fn shader(words: &[u32], uav: u32, io: ComputeIo) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
         stride_table: l.stride_table,
         run_time_buffers: l.run_time_buffers,
     }
@@ -173,15 +174,16 @@ fn raw_view_of(
     )
 }
 
-/// The table's dwords for `entries`, slot 0 on.
+/// The table's dwords for `entries`, slot 0 on, after its header
+/// ([`super::STRIDE_HEADER`]: every slot mirrored).
 fn table(entries: &[StrideEntry]) -> Vec<u32> {
-    entries
-        .iter()
-        .flat_map(|e| {
-            let bits = e.bits().expect("an entry the table holds");
-            [bits as u32, (bits >> 32) as u32]
-        })
-        .collect()
+    let n = entries.len() as u32;
+    let mut words = vec![0, n, 0, n];
+    words.extend(entries.iter().flat_map(|e| {
+        let bits = e.bits().expect("an entry the table holds");
+        [bits as u32, (bits >> 32) as u32]
+    }));
+    words
 }
 
 /// Runs `cs` in `groups` groups with user data `user` (`s0..s3`; the table
@@ -268,6 +270,32 @@ const LOAD_AT: &[u32] = &[
     0x8003_0305, // buffer_store_dwordx2 v[3:4], v5, s[12:15], 0 offen offset:4
     0xBF81_0000, // s_endpgm
 ];
+
+/// A program that reads by element a buffer whose known stride the table
+/// cannot carry is refused with the stride it saw (watch.md item 318):
+/// 1 to 3 bytes (R8 and R16 structured buffers), or off a multiple of 4;
+/// they were counted as unknown strides, which the table translates.
+#[test]
+fn small_and_odd_strides_are_refused_apart_from_unknown_ones() {
+    let why = |stride, target| match lowered_with(LOAD_STORE_ATOMICS, 8, ONE_THREAD, target, stride)
+    {
+        Err(crate::ShaderError::Unsupported { what, .. }) => what.to_string(),
+        other => format!("{:?}", other.map(|l| l.stride_table)),
+    };
+    for target in [Target::ANY, TABLE] {
+        for stride in [1, 2, 3] {
+            assert_eq!(why(stride, target), "a structured buffer of stride 1 to 3");
+        }
+        for stride in [6, 10, 18] {
+            assert_eq!(
+                why(stride, target),
+                "a structured buffer of stride off a multiple of 4"
+            );
+        }
+    }
+    assert_eq!(why(0, Target::ANY), "a structured buffer of unknown stride");
+    assert_eq!(why(0, TABLE), "Ok(true)", "the table translates it");
+}
 
 /// Without the table (the host binds none) a program that reads a buffer
 /// by element of unknown stride is refused as before; with it, it reads
@@ -745,6 +773,7 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
         static_samplers: Vec::new(),
         root_cbvs: plain.root_cbvs,
         root_srvs: plain.root_srvs,
+        root_uavs: plain.root_uavs,
         stride_table: false,
         run_time_buffers: plain.run_time_buffers,
     };
@@ -766,6 +795,7 @@ fn known_strides_read_raw_views_with_xtp_raw_structured() {
             static_samplers: Vec::new(),
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
             stride_table: true,
             run_time_buffers: l.run_time_buffers,
         }

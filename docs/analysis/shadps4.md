@@ -158,8 +158,8 @@ structured program, `SharedMemoryBarrierPass`, `LowerWave64BallotPass`
 ### 3.1 "an address in an SGPR that is no root parameter" (34 compute)
 
 **XTP.** `resource.rs` 909 (`why_no_base`): the address's computed term
-is an entry SGPR that holds no root parameter. All 34 refuse at code
-offsets 0x2c to 0x40, at the start of the program. **None of the 34 is in
+is an entry SGPR that holds no root parameter. All 34 originally refused
+at the first reads of the table. **None of the 34 is in
 the title's shader pack**, while every other program refused in the
 session is. With the fork's measurement (fxceless's VIctory fork, `578d459`,
 `victory-shader/src/spill.rs`: "every compute program of the console's
@@ -203,9 +203,67 @@ XTP now tracks each loaded SSA word by root parameter and dword
 (`resource/spill.rs`, ported from VIctory `27c3dc9d5`). It packs the
 constants and descriptor-table offsets the shader reads into the existing
 per-dispatch root constants. Root views use their existing slot bindings.
-On the L4 all 34 reached a later instruction. Thirteen reached emission
+At `6e99955` on the L4 all 34 reached a later instruction. Thirteen reached emission
 and stopped at a root UAV or typed root view. The other 21 stopped during
 address tracking. None emitted DXIL.
+
+Les 13 refus de vue racine disparaissent avec une table D3D12 d'un UAV
+brut par slot. La vue couvre la copie hôte du tampon et le shader ajoute
+la distance entre le début aligné de la vue et l'adresse donnée par le
+titre. Cela sert aussi pour les compteurs. Les accès par demi-mot
+préservent les octets voisins. Un DispatchX en unités de threads transmet
+les trois dimensions au shader du constructeur. Dans un groupe de queue,
+les écritures et les comptages d'EXEC respectent ces limites, y compris
+lorsque deux vagues hôtes exécutent une vague console et échangent via LDS.
+
+Origine du premier accès refusé dans les 21 autres programmes du relevé
+initial. Les préfixes identifient les empreintes BLAKE3 de la session.
+
+| Programmes | Première adresse | Résolution |
+|---|---|---|
+| 6 · `9205d265`, `894c9165`, `a63e2dfc`, `198f6dfd`, `cb9647e7`, `4b5aedc0` | Une constante donne une adresse en unités de 256 octets. Le champ lu tient dans les huit bits libérés. | Les deux moitiés doivent provenir du même décalage. L'hôte lie la copie du tampon et le shader lit le champ dans une SRV brute. |
+| 8 · `a197f50c`, `f28a33a8`, `c85822de`, `6f6a359d`, `162216b9`, `7bb5b1b9`, `3df629ff`, `ffd93c8a` | Deux dwords consécutifs de constantes forment une adresse complète. | Les lectures à déplacement fixe utilisent une SRV si les mots appartiennent au même paramètre. Pour une copie en VGPR, les lanes qui lisent doivent avoir exécuté les deux copies. Plusieurs variantes calculent ensuite un index avec une retenue 64 bits à partir de données lues sur le GPU. |
+| 2 · `190fbf0e`, `f6e47efa` | Une paire intérieure aux constantes déportées sert de pointeur. Le premier programme lui ajoute un index par lane dès la première lecture. | La paire seule peut désigner une vue. Les accès suivants parcourent la mémoire et comprennent des opérations atomiques globales. |
+| 2 · `5279ae36`, `35e51bb2` | La lane reconstruit une adresse et y insère un numéro de champ. | La paire varie entre lanes. Une vue uniforme liée au début du dispatch ne suffit pas. |
+| 3 · `5e687674`, `5062bc7a`, `3cea4534` | Le tampon source contient lui-même l'adresse de la prochaine ressource. | Les deux premiers lisent à une adresse indexée par lane, le troisième y écrit. La ressource de destination n'est connue qu'à l'exécution sur le GPU. |
+
+Pour ces parcours indirects, le fork associe les pages d'adresses du titre
+à des vues utilisables par le shader. XTP dispose des copies côté hôte.
+Le shader aurait besoin de la correspondance décrite en §5.4 pour choisir
+la copie, vérifier les limites et conserver l'identité des écritures et
+des opérations atomiques.
+
+Sur le L4 en vagues de 32 lanes, `translate --list --validate --pipelines`
+sur `1084cf6` donne **21 DXIL validés et 21 pipelines créés parmi les
+34 programmes de la session (+21, 0 perdu)**. Ce sont les 13 programmes
+à vue racine, les six à adresse compactée, ainsi que `162216b9` et
+`3df629ff`. Les 13 autres s'arrêtent au suivi d'adresse. Parmi eux,
+`5e687674` reste le refus de l'item 312. Les trois autres empreintes
+suivies par cet item (`caa78b8c`, `28918b71`, `4ddd6f97`) ont un
+pipeline. Sur les 52 conteneurs de la bibliothèque, le même relevé passe
+de 0 à 30 DXIL validés et pipelines créés.
+
+Le pack du titre et la bibliothèque système se mesurent séparément. Sur la
+ferme, la comparaison de `6e99955` et `1084cf6` avec
+`shader-survey --host-lanes 32-32 --json` donne les mêmes résultats pour
+les 26 698 programmes, entrée par entrée. Les 25 725 programmes traduits
+ont tous conservé la même empreinte DXIL.
+Après intégration de `main` (`d24d377`), le même relevé sur la ferme
+compare cette base à `8e29dce`. Les 25 768 traductions produisent le même
+DXIL et les 930 refus gardent leur catégorie.
+
+La veille 26 (item 362, VIctory #2118) signale qu'un constructeur exécuté
+en partie peut écrire une structure incomplète. Au chargement de la DLL,
+XTP inventorie ses conteneurs et reconnaît leurs copies par contenu. La
+première création d'un pipeline du constructeur lance la préparation de
+toute la bibliothèque. Si un pipeline est en préparation au premier
+dispatch, tous les dispatchs du constructeur sont ignorés pour cette image,
+sans attendre les compilateurs. Un seul refus bloque le constructeur pour
+la session, y compris les programmes déjà prêts. Le journal indique
+`BVH builder held` avec une empreinte
+refusée, ou `BVH builder admitted` quand tous les pipelines sont prêts.
+Pour le test RT A/B (`ffc6d315`), relever ce verdict sur le chemin A :
+avec `held`, la mesure ne représente pas un BVH construit par le GPU.
 
 **Image impact:** the largest dispatch count of all classes (223 a frame),
 but the builder only makes the ray-tracing structure. Nothing is lit by it

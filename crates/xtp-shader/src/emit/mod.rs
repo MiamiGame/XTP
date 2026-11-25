@@ -85,6 +85,8 @@ mod desc_data_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod geometry_tests;
+#[cfg(all(test, windows))]
+mod group_id_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]
@@ -279,6 +281,8 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// UAV racine lus ou écrits par le programme, au registre u du même numéro.
+    pub root_uavs: Vec<u8>,
     /// Whether the shader reads the host's runtime stride table (`t0` in
     /// [`STRIDE_SPACE`], a [`StrideEntry`] per view-heap slot): only when
     /// translated for a [`Target`] that has one.
@@ -326,6 +330,33 @@ pub const RUN_TIME_READS: u8 = 1;
 /// [`HostShader::run_time_buffers`]: unordered access views through slots
 /// picked at run time (they may be written).
 pub const RUN_TIME_WRITES: u8 = 2;
+
+/// Octets entre le début aligné de la vue brute et l'adresse de l'UAV racine.
+pub const ROOT_UAV_BIAS: RootType = RootType::Other(0x103);
+/// Limite de chaque axe d'un DispatchX exprimé en threads, zéro pour un axe entier.
+pub const DISPATCH_THREADS: RootType = RootType::Other(0x104);
+/// Indices de SRV calculés à partir des constantes racine du dispatch.
+pub const PACKED_ADDRESS_SRV: RootType = RootType::Other(0x105);
+pub const SCALAR_ADDRESS_SRV: RootType = RootType::Other(0x106);
+pub const VECTOR_ADDRESS_SRV: RootType = RootType::Other(0x107);
+
+/// Entries before slot 0's in the host's runtime stride table
+/// ([`StrideEntry`]): slot `i`'s entry is at `(i + STRIDE_HEADER) * 8`. The
+/// first holds, in its high dword, the title slots the host heap mirrors;
+/// the second, the entries after the header; both low dwords are 0, so
+/// either reads as no view. The table is a root SRV, which has no size: a
+/// shader reads an entry only below those counts, and the first otherwise.
+pub const STRIDE_HEADER: u32 = 2;
+
+/// The bit of a view-heap index (bit 31 of the byte offset in the user
+/// data) that says the host remapped it: a table the host made afresh in
+/// dynamic slots. Only for targets with the stride table, where every heap
+/// index loses it before a handle is made. Through the table, an index
+/// with it reads the entry of its dynamic slot; one without it is the
+/// title's, read only below the slots the host mirrors (a title slot past
+/// a capped host heap has no host slot, and dynamic slots hold other
+/// tables there).
+pub const REMAPPED_SLOT: u32 = 1 << 26;
 
 impl HostShader {
     /// Size of the user-data buffer the shader declares, in dwords (a
@@ -429,6 +460,13 @@ pub fn last_module_summary() -> String {
         format!("{summary}; {flow}")
     }
 }
+
+/// Joins where a descriptor's dword took an undefined value in the console
+/// flow without the proof that no lane reads it there (the `shortcut:` of
+/// `lower/flow.rs`'s descriptor-word rule), over every translation of the
+/// process: what a survey or a session reports of that shortcut.
+pub static UNPROVEN_DESCRIPTOR_JOINS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
     /// The form of the program [`emit_for`] translated last on this thread
@@ -695,6 +733,7 @@ pub fn emit_for(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
         stride_table: l.stride_table,
         run_time_buffers: l.run_time_buffers,
     })
@@ -983,6 +1022,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
             stride_table: false,
             run_time_buffers: 0,
         };
@@ -996,6 +1036,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
                 stride_table: false,
                 run_time_buffers: 0,
             })

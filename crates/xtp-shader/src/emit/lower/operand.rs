@@ -275,6 +275,13 @@ impl<'a> Lower<'a> {
         }
     }
 
+    pub(super) fn effect_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        Ok(match self.guard(b, i)? {
+            Some(bit) => Some(self.with_partial(self.cur, bit)),
+            None => self.partial_active,
+        })
+    }
+
     /// The lanes that may run scalar memory read `(b, i)` through a
     /// descriptor that differs between lanes (a heap index per lane): its
     /// lanes' EXEC there, where some lane outside EXEC can get there (every

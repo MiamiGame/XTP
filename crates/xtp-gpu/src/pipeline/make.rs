@@ -127,7 +127,7 @@ impl Pending {
     /// Makes the host pipeline (once); true for the call that made it,
     /// which runs `counted` before signalling it finished: whoever sees
     /// `finished` sees what `counted` counted.
-    fn make(&self, counted: impl FnOnce()) -> bool {
+    pub(super) fn make(&self, counted: impl FnOnce()) -> bool {
         let mut first = false;
         self.made.get_or_init(|| {
             first = true;
@@ -355,6 +355,47 @@ pub(crate) fn early(p: &Arc<Pending>) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         POOLS.start(p, EARLY);
     }
+}
+
+pub(super) fn start_builder(p: &Arc<Pending>) {
+    POOLS.start(p, EARLY);
+}
+
+/// Un seul verdict pour toute la session. Un refus suffit, même si d'autres
+/// compilations sont en cours. Le succès exige le dernier pipeline hôte.
+fn builder_verdict(states: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut ready = Some(true);
+    for state in states {
+        match state {
+            Some(false) => return Some(false),
+            None => ready = None,
+            Some(true) => {}
+        }
+    }
+    ready
+}
+
+pub(super) fn admit_builder<'a>(
+    members: impl Iterator<Item = &'a Arc<Pending>> + Clone,
+) -> Option<bool> {
+    let state = |p: &Arc<Pending>| p.made.get().map(Option::is_some);
+    let admitted = builder_verdict(members.clone().map(state))?;
+    let total = members.clone().count();
+    if admitted {
+        tracing::info!(members = total, "BVH builder admitted");
+    } else if let Some(p) = members.clone().find(|p| state(p) == Some(false)) {
+        tracing::warn!(members = total, refused = %p.shaders[0].hash, "BVH builder held");
+    }
+    Some(admitted)
+}
+
+#[test]
+fn builder_requires_every_host_pipeline() {
+    let verdict = |states: &[Option<bool>]| builder_verdict(states.iter().copied());
+    assert_eq!(verdict(&[Some(true), None]), None);
+    assert_eq!(verdict(&[Some(true), None, Some(false)]), Some(false));
+    assert_eq!(verdict(&[Some(false), Some(true)]), Some(false));
+    assert_eq!(verdict(&[Some(true), Some(true)]), Some(true));
 }
 
 /// Waits for `p` while title frame `frame` has budget left for its kind.

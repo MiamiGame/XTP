@@ -220,6 +220,25 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    /// Renumber the signature IDs in pixel input reads after omitting an
+    /// unused element. Each operation takes the element ID after its opcode.
+    pub(super) fn remove_pixel_input(&mut self, removed: usize, count: usize) {
+        let shifted: HashMap<_, _> = (removed + 1..count)
+            .map(|i| (self.i32(i as u32), self.i32(i as u32 - 1)))
+            .collect();
+        for inst in &mut self.insts {
+            if let Op::Call(func, args) = &mut inst.op {
+                let name = &self.funcs[*func as usize].name;
+                if (name.starts_with("dx.op.loadInput.")
+                    || name.starts_with("dx.op.attributeAtVertex."))
+                    && let Some(&new) = shifted.get(&args[1])
+                {
+                    args[1] = new;
+                }
+            }
+        }
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);

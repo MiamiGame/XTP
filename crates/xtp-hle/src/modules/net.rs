@@ -433,6 +433,13 @@ pub extern "system" fn WSAIoctl(
     result
 }
 
+pub extern "system" fn send(s: Socket, buf: *const u8, len: i32, flags: i32) -> i32 {
+    let _pin = xtp_gpu::pin_title_read(buf as usize, len.max(0) as usize);
+    host!("ws2_32.dll", "send": extern "system" fn(Socket, *const u8, i32, i32) -> i32)(
+        s, buf, len, flags,
+    )
+}
+
 // Datagram sends.
 
 /// Without an address it sends to the connected peer, which `connect` vetted;
@@ -448,6 +455,7 @@ pub extern "system" fn sendto(
     if !to.is_null() && !stream(s) && !reachable("network datagram blocked", to, to_len) {
         return SOCKET_ERROR;
     }
+    let _pin = xtp_gpu::pin_title_read(buf as usize, len.max(0) as usize);
     host!("ws2_32.dll", "sendto": extern "system" fn(Socket, *const u8, i32, i32, *const u8, i32) -> i32)(
         s, buf, len, flags, to, to_len,
     )
@@ -843,6 +851,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(WSAConnectByList),
             hle_export!(WSAJoinLeaf),
             hle_export!(WSAIoctl),
+            hle_export!(send),
             hle_export!(sendto),
             hle_export!(WSASendTo),
             hle_export!(WSASendMsg),
@@ -869,6 +878,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(WinHttpGetProxySettingsEx),
             ordinal("#2", bind as *const () as usize),
             ordinal("#4", connect as *const () as usize),
+            ordinal("#19", send as *const () as usize),
             ordinal("#20", sendto as *const () as usize),
             ordinal("#51", gethostbyaddr as *const () as usize),
             ordinal("#52", gethostbyname as *const () as usize),

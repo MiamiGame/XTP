@@ -110,11 +110,41 @@ enum Reuse {
     Descriptor,
     /// No branch: each lane stores s10, the record count.
     Count,
+    /// [`Reuse::Number`] without the second test (Codex review 3983f844):
+    /// after the join every lane stores s8, the number where the flag is
+    /// set, the buffer's descriptor dword 0 (its address) where it is 0.
+    EveryEdge,
 }
+
+/// A loop whose lane read (`v_readlane_b32`) and divergent branch make a
+/// program run in the console flow (`lower/flow.rs`'s
+/// `the_console_flow_keeps_a_descriptor_join_unproven_and_counts_it`): it
+/// writes s9, s10 (EXEC kept) and v2, which the programs below set again
+/// before they read them.
+const CONSOLE_FLOW_LOOP: [u32; 12] = [
+    0xBE89_0380, // s_mov_b32 s9, 0
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x7D8A_0080, // v_cmp_ne_u32 vcc, 0, v0
+    0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+    0xBF88_0006, // s_cbranch_execz -> end
+    0xD760_0009,
+    0x0001_0300, // loop: v_readlane_b32 s9, v0, 1
+    0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+    0x7D82_0102, // v_cmp_lt_u32 vcc, v2, v0
+    0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+    0xBF89_FFFA, // s_cbranch_execnz -> loop
+    0x887E_0A7E, // end: s_or_b32 exec_lo, exec_lo, s10
+];
 
 /// The program of [`Reuse`] `reuse`: lane t stores at 4 × t of the UAV.
 fn program(reuse: Reuse) -> NativeProgram {
-    let mut w = vec![s_mov(5, ZERO), s_mov(4, 0)];
+    program_after(&[], reuse)
+}
+
+/// [`program`] after the code `first`.
+fn program_after(first: &[u32], reuse: Reuse) -> NativeProgram {
+    let mut w = first.to_vec();
+    w.extend([s_mov(5, ZERO), s_mov(4, 0)]);
     w.extend(smem(S_LOAD_DWORDX4, 8, 4, 0));
     w.extend(smem(S_LOAD_DWORDX4, 20, 4, 0x20));
     w.push(WAIT_SCALAR);
@@ -136,6 +166,11 @@ fn program(reuse: Reuse) -> NativeProgram {
             w.extend([s_cmp_eq_u32(12, ZERO), s_cbranch_scc1(1), v_mov(1, 8)]);
         }
         Reuse::Count => w.push(v_mov(1, 10)),
+        Reuse::EveryEdge => {
+            w.extend([s_cmp_eq_u32(12, ZERO), s_cbranch_scc1(3)]);
+            w.extend(smem(S_BUFFER_LOAD_DWORD, 8, 8, 4));
+            w.extend([WAIT_SCALAR, v_mov(1, 8)]);
+        }
     }
     w.push(v_lshl(2, 2, 0));
     w.extend(store(1, 2, 20));
@@ -191,6 +226,13 @@ fn refusal(native: &NativeProgram) -> Option<&'static str> {
 #[test]
 fn smem_a_constant_buffers_registers_reused_for_a_number_translate() {
     let cs = translate(&program(Reuse::Number)).expect("translated");
+    number_on_its_edge_only(&cs);
+}
+
+/// Runs `cs`, a program of [`Reuse::Number`]'s form, on WARP: the
+/// number's edge gives the number (77, the buffer's dword 1), the other
+/// edge 7. Nothing where there is no WARP device.
+fn number_on_its_edge_only(cs: &HostShader) {
     // One GPU test at a time (see `valu_tests::ONE_AT_A_TIME`).
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
@@ -199,7 +241,7 @@ fn smem_a_constant_buffers_registers_reused_for_a_number_translate() {
         eprintln!("no WARP device; skipped");
         return;
     };
-    let (root, pso) = host.compute_pipeline(&cs).expect("a pipeline");
+    let (root, pso) = host.compute_pipeline(cs).expect("a pipeline");
     for (flag, want) in [(1, 77), (0, 7)] {
         // A whole constant buffer (256 bytes): the flag, then the number.
         let mut cb = vec![0u32; 64];
@@ -233,5 +275,44 @@ fn smem_a_constant_buffers_dwords_read_as_numbers_stay_refused() {
             refusal(&program(reuse)),
             Some("a constant buffer's descriptor read as data")
         );
+    }
+}
+
+/// A number among the join's values does not show that only its edge is
+/// read (Codex review 3983f844, P1): [`Reuse::EveryEdge`] reads the joined
+/// s8 on both edges, so where the flag is 0 the console stores the
+/// descriptor's dword 0. Per lane the join's proof finds that read and the
+/// program stops; in the console flow (after [`CONSOLE_FLOW_LOOP`]), where
+/// a descriptor's dword at a join is taken undefined without the proof,
+/// the load keeps its refusal, and the per-lane form, which the program
+/// then takes, stops it the same way. Before the fix the console flow
+/// translated it, the store taking an undefined value on that edge.
+#[test]
+fn smem_a_number_join_read_on_the_descriptors_edge_stays_refused() {
+    for first in [&[][..], &CONSOLE_FLOW_LOOP[..]] {
+        assert_eq!(
+            refusal(&program_after(first, Reuse::EveryEdge)),
+            Some("a descriptor's address or format read as data"),
+            "{} words first",
+            first.len()
+        );
+    }
+}
+
+/// [`Reuse::Number`] after [`CONSOLE_FLOW_LOOP`]: the console flow keeps
+/// the constant buffer's refusal, so the program takes the per-lane form,
+/// whose proof finds the joined s8 read only behind the flag (before the
+/// fix it ran in the console flow, the join unproven). On WARP where the
+/// shader needs no wave size: its lane read asks for 32-lane waves, for
+/// which the farm's WARP makes no pipeline ("The parameter is incorrect"),
+/// and the first test above checks this proof's values.
+#[test]
+fn smem_a_number_join_in_a_console_flow_program_takes_the_per_lane_form() {
+    let cs = translate(&program_after(&CONSOLE_FLOW_LOOP, Reuse::Number)).expect("translated");
+    let flow = super::last_module_summary();
+    assert!(flow.ends_with("; per lane"), "{flow}");
+    match cs.wave_size() {
+        None => number_on_its_edge_only(&cs),
+        Some(n) => eprintln!("WaveSize({n}): not run on WARP"),
     }
 }

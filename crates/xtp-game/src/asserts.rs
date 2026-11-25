@@ -247,6 +247,7 @@ pub fn census(
 fn read_own(at: u64) -> Option<u64> {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let _pin = xtp_gpu::pin_copy_back(at as usize, size_of::<u64>());
     let (mut value, mut read) = (0u64, 0usize);
     // SAFETY: reads into a local; the call fails, rather than faults, on
     // memory that cannot be read.

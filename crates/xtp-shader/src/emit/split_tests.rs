@@ -846,7 +846,7 @@ fn the_last_modules_summary_names_its_group_wave_size_and_operations() {
     let summary = super::last_module_summary();
     eprintln!("{summary}");
     assert!(
-        summary.starts_with("threads 8x8x1, wave size 32; ops: "),
+        summary.starts_with("threads 64x1x1, wave size 32; ops: "),
         "{summary}"
     );
     for op in ["barrier", "waveReadLaneAt", "flattenedThreadIdInGroup"] {

@@ -228,6 +228,28 @@ fn rows_sort_by_register_then_name() {
     assert_eq!(rows, [(0, Some(0)), (1, Some(1)), (0, None)]);
 }
 
+#[test]
+fn an_unread_front_face_sharing_a_row_with_a_linear_read_is_omitted() {
+    for (face_col, float_col) in [(0, 1), (1, 0)] {
+        let face = front_face(1, face_col);
+        let varying = float(0, 2, float_col);
+        for (inputs, read) in [
+            (vec![position(), face.clone(), varying.clone()], 2),
+            (vec![position(), varying, face], 1),
+        ] {
+            let ps = pixel(inputs, &[read]);
+            assert_eq!(
+                rows_of(&ps, FourCC::ISG1),
+                [
+                    ("SV_Position".to_owned(), 0, Some(0), 0),
+                    ("TEXCOORD".to_owned(), 0, Some(1), float_col)
+                ]
+            );
+            validates("front face beside linear float", &ps);
+        }
+    }
+}
+
 /// The modes [`one_mode_per_row`] gives each row's elements.
 fn modes(mut elements: Vec<SigElement>, read: &[usize], pixel_inputs: bool) -> Vec<u8> {
     for &i in read {

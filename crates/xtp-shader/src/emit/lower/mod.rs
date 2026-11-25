@@ -118,6 +118,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     /// The program reads the host's runtime stride table.
     pub stride_table: bool,
     /// Buffers read (and written) through view-heap slots the program
@@ -202,19 +203,37 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
             what: UNTRACKED_SELECT,
             ..
         }) if parts.native.stage == HwStage::Cs => lower_program(parts, true),
-        Err(ShaderError::Unsupported {
-            what: "the first half of an interpolation" | "a hardware SGPR input",
-            ..
-        }) if parts.native.stage == HwStage::Ps => {
-            let mut io = crate::io::raise_inputs(parts.p, parts.native, true)?;
-            io.initialized_sgprs = parts.native.io.ps_initialized_sgprs();
-            lower_program(
-                &Parts {
-                    io: &io,
-                    ..parts.clone()
-                },
-                false,
-            )
+        Err(original @ ShaderError::Unsupported { what, .. })
+            if parts.native.stage == HwStage::Ps
+                && matches!(
+                    what,
+                    "the first half of an interpolation" | "a hardware SGPR input"
+                ) =>
+        {
+            let retry = |io: &mut Io| {
+                io.initialized_sgprs = parts.native.io.ps_initialized_sgprs();
+                lower_program(
+                    &Parts {
+                        io,
+                        ..parts.clone()
+                    },
+                    false,
+                )
+            };
+            if what == "a hardware SGPR input" {
+                // Le nombre de SGPR définis à l'entrée ne change aucune paire.
+                match retry(&mut parts.io.clone()) {
+                    Ok(result) => return Ok(result),
+                    Err(ShaderError::Unsupported {
+                        what: "the first half of an interpolation",
+                        ..
+                    }) => {}
+                    Err(_) => return Err(original),
+                }
+            }
+            crate::io::raise_inputs(parts.p, parts.native, true)
+                .and_then(|mut io| retry(&mut io))
+                .map_err(|_| original)
         }
         result => result,
     }
@@ -264,6 +283,9 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     group_base_row: Option<V>,
+    host_words: Vec<(UserData, V)>,
+    host_rows: Vec<V>,
+    partial_active: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
@@ -503,6 +525,15 @@ impl<'a> Lower<'a> {
         }
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.ordered_uavs = x.native.io.pops();
+        // Portage de VIctory #2085 (0xkn0wh3r3, 1f6fa41, GPL-3.0).
+        // DEPTH_BEFORE_SHADER fait rejeter les pixels masqués avant leurs écritures UAV.
+        if let StageIo::Ps {
+            db_shader_control, ..
+        } = x.native.io
+            && db_shader_control & (1 << 12) != 0
+        {
+            s.flags |= super::shader::flags::FORCE_EARLY_DEPTH_STENCIL;
+        }
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
@@ -780,6 +811,9 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             group_base_row: None,
+            host_words: Vec::new(),
+            host_rows: Vec::new(),
+            partial_active: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -926,6 +960,9 @@ impl<'a> Lower<'a> {
         if !self.s.m.paired_lanes() {
             self.find_sections();
         }
+        if !self.x.res.spill_loads.is_empty() {
+            self.dispatch_threads();
+        }
         self.inputs()?;
         self.merged_start()?;
         if let Some(mesh) = self.s.mesh {
@@ -981,6 +1018,17 @@ impl<'a> Lower<'a> {
         self.fill_phis()?;
         #[cfg(debug_assertions)]
         self.s.m.assert_paired_branches();
+        let mut user_data: Vec<_> = self.user_reads.values().copied().collect();
+        let first = self.s.user_data.next_multiple_of(4);
+        for (i, row) in self.host_rows.iter().enumerate() {
+            let actual = self.s.m.i32(first / 4 + i as u32);
+            self.s.m.replace_const(*row, actual);
+        }
+        for (mut binding, _) in self.host_words {
+            binding.index += first;
+            self.s.user_data = binding.index + 1;
+            user_data.push(binding);
+        }
         let group_base = self.group_base_row.map(|row| {
             // La rangée suivante reste libre même si des constantes du titre sont déportées.
             let offset = self.s.user_data.next_multiple_of(4);
@@ -989,10 +1037,10 @@ impl<'a> Lower<'a> {
             self.s.user_data = offset + 3;
             offset
         });
-        let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let stride_table = self.s.stride_table.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
@@ -1010,6 +1058,7 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             stride_table,
             run_time_buffers: self.run_time_buffers,
             #[cfg(test)]

@@ -115,6 +115,8 @@ pub struct Resources {
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
+    /// Lectures à déplacement fixe dont les constantes racine donnent toute l'adresse.
+    pub constant_reads: std::collections::BTreeMap<Site, ConstantRead>,
     pub descriptors: Vec<Descriptor>,
     /// Loads replaced with root arguments, sorted by instruction site.
     pub spill_loads: Vec<Site>,
@@ -123,6 +125,17 @@ pub struct Resources {
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstantRead {
+    pub slot: u8,
+    pub dword: u32,
+    pub packed: bool,
+    pub offset: u32,
+}
+
+/// Taille maximale de la copie d'une SRV racine mal alignée sur l'hôte.
+pub const MISALIGNED_SRV_BYTES: u32 = 1 << 20;
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
 /// reads the first active lane's descriptor with `v_readfirstlane_b32`,
@@ -201,6 +214,12 @@ fn trace(mut t: Tracer<'_>) -> Result<Resources, ShaderError> {
                     let &(param, dword) = t.spill.bindings.get(&v)?;
                     Some((v, param, dword))
                 }));
+                continue;
+            }
+            if t.spill.active
+                && let Some(read) = t.constant_read(inst, site)
+            {
+                out.constant_reads.insert(site, read);
                 continue;
             }
             let fail = |what| ShaderError::Unsupported {

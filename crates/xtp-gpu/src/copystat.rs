@@ -119,8 +119,17 @@ pub(crate) enum C {
     BackComparedSmall,
     BackComparedMid,
     BackComparedBig,
+    ReadFaults,
+    WriteFaults,
+    ReadFaultNs,
+    KernelReadPages,
+    KernelReadNs,
+    DeferredBytes,
+    CapacityCopies,
+    BackScanNs,
+    Count,
 }
-const COUNTERS: usize = 60;
+const COUNTERS: usize = C::Count as usize;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -239,6 +248,30 @@ pub(crate) fn log(frames: f64) {
         crate::shadow::MIRRORS.load(Relaxed) as f64 / 1e6,
         crate::shadow::mirror_phase(),
     );
+    if c[C::BackCompared as usize] > 0.0 {
+        tracing::info!(
+            "snapshot plus CPU compare per frame: {:.3} ms ({:.3} ms scanning)",
+            ms(c[C::SnapshotUs as usize]) + c[C::BackScanNs as usize] / 1e6,
+            c[C::BackScanNs as usize] / 1e6
+        );
+    }
+    if crate::readmap::enabled() {
+        tracing::info!(
+            frames = frames as u64,
+            pending_bytes = crate::readmap::PENDING_BYTES.load(Relaxed),
+            capacity_copies = (c[C::CapacityCopies as usize] * frames).round() as u64,
+            read_faults = (c[C::ReadFaults as usize] * frames).round() as u64,
+            write_faults = (c[C::WriteFaults as usize] * frames).round() as u64,
+            handler_us = (c[C::ReadFaultNs as usize] * frames / 1e3).round() as u64,
+            kernel_pages = (c[C::KernelReadPages as usize] * frames).round() as u64,
+            kernel_us = (c[C::KernelReadNs as usize] * frames / 1e3).round() as u64,
+            "copy-back map per frame: {:.2} MB deferred, {:.1} read and {:.1} write faults, {:.3} ms in handlers",
+            mb(c[C::DeferredBytes as usize]),
+            c[C::ReadFaults as usize],
+            c[C::WriteFaults as usize],
+            c[C::ReadFaultNs as usize] / 1e6
+        );
+    }
     if c[C::FullRefreshes as usize] > 0.0 {
         tracing::info!(
             "full refreshes per frame (XTP_FULL_REFRESH): {:.1}, {:.1} MB in {:.1} ms, {:.2} MB              of pieces the write tracking missed",

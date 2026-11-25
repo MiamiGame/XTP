@@ -17,6 +17,8 @@ use crate::resource::{Address, CODE, Role, Site, Source};
 /// tiling) holds as data: [`Lower::descriptor_data`] rebuilds only sizes.
 pub(super) const DESCRIPTOR_WORD: Why = "a descriptor's address or format read as data";
 
+pub(super) const ONLY_DATA: Why = "a descriptor read only as data";
+
 /// What [`Lower::unused_descriptor`] finds a descriptor load to be.
 enum Unused<'a> {
     /// No dword has a host value ([`DESCRIPTOR_WORD`]): a join takes it as
@@ -39,6 +41,15 @@ impl<'a> Lower<'a> {
         // Each result already has its own root-parameter binding in params.
         // get() materializes it on first use, including after an SGPR overwrite.
         if self.x.res.spill_loads.binary_search(&site).is_ok() {
+            return Ok(());
+        }
+        if let Some(&read) = self.x.res.constant_reads.get(&site) {
+            let h = self.constant_read_handle(read, true);
+            for (k, &(reg, _)) in inst.writes.iter().enumerate() {
+                let at = self.s.m.i32(read.offset + 4 * k as u32);
+                let x = self.raw_words(h, at, 1)[0];
+                self.write(inst, reg, x, None);
+            }
             return Ok(());
         }
         let Fields::Smem {
@@ -617,7 +628,6 @@ impl<'a> Lower<'a> {
         count: u32,
         dwords: &[Option<Value>],
     ) -> Result<Unused<'a>, Why> {
-        const ONLY_DATA: Why = "a descriptor read only as data";
         let sampler = self.x.res.descriptors.iter().any(|d| {
             d.role == Role::Sampler
                 && d.source.leaves().into_iter().any(|l| {

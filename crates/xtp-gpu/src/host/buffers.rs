@@ -1022,6 +1022,48 @@ mod tests {
         });
     }
 
+    #[test]
+    fn overlapping_card_copies_publish_each_submissions_own_words() {
+        use crate::testgpu::TitleBuffer;
+        let test =
+            "host::buffers::tests::overlapping_card_copies_publish_each_submissions_own_words";
+        with_cards(test, |host| {
+            let big = TitleBuffer::new(2 << 20);
+            let input = TitleBuffer::new(2 * crate::watch::PAGE);
+            let at = big.address();
+            let page = crate::watch::PAGE as u64;
+            input.set_words(|i| 0x1000 + i as u32);
+            assert!(big.shadow().carded());
+            let [first, second] = std::array::from_fn(|_| host.new_list().unwrap());
+            for (list, source) in [(&first, input.address()), (&second, input.address() + page)] {
+                assert!(crate::shadow::copy(list, at + 2 * page, source, 256));
+                list.close();
+            }
+            let mut gate = crate::host::submissions::Gate::close(host);
+            host.execute(&[&first]);
+            let (send, observed) = std::sync::mpsc::channel();
+            host.after(move || {
+                // SAFETY: the test owns the live title buffer through drain.
+                send.send(unsafe { ((at + 2 * page) as *const u32).read_volatile() })
+                    .unwrap();
+            });
+            std::thread::scope(|s| {
+                s.spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    gate.open();
+                });
+                host.execute(&[&second]);
+                assert_eq!(
+                    observed.try_recv(),
+                    Ok(0x1000),
+                    "A was consumed before B could reuse its return bytes"
+                );
+            });
+            host.drain();
+            assert_eq!(words(&big, 2 * page), words(&input, page));
+        });
+    }
+
     /// One word the GPU changes in a piece of 64 KiB is found, wherever it
     /// is in the piece (each of the 256 threads of the card's compare takes
     /// other words of it: the shaders are declared to write the whole

@@ -51,8 +51,8 @@ pub(crate) struct HostHeap {
     /// of title slots with `XTP_STRIDE_TABLE=1`
     /// ([`crate::device::stride_table_on`]).
     strides: Option<Strides>,
-    /// The last [`HostHeap::picked_spans`]: its frame, and what it found.
-    picked: Mutex<Option<(u64, Arc<Picked>)>>,
+    /// The sweeps of [`HostHeap::picked_spans`].
+    picked: Mutex<Sweeps>,
     /// View heaps: the title slots holding a view of a texture the title
     /// may fill, for shaders that pick textures by index
     /// ([`TextureQueue`], [`HostHeap::texture_pass`]).
@@ -70,11 +70,14 @@ pub(crate) struct HostHeap {
 /// Slots past the dynamic ones in a view heap with a runtime stride table,
 /// for the raw views its entries name ([`Strides`]): one per structured or
 /// typed buffer view the heap holds, and one per such view replaced while
-/// a list that may read it has not run.
+/// a submission that may read it has not run.
 /// shortcut: a guess (VIctory #704's), not a measured need; past it a view
 /// gets no raw view, so its entry holds none and reads through the table
-/// give zeros (logged once).
+/// give zeros until a raw view is free again (logged once).
 const ALIASES: u32 = 1 << 16;
+
+/// Entries before slot 0's in the table ([`xtp_shader::emit::STRIDE_HEADER`]).
+const HEADER: u32 = xtp_shader::emit::STRIDE_HEADER;
 
 /// A view heap's runtime stride table: an entry per slot
 /// ([`StrideEntry`]), written with the slot's descriptor, and the raw
@@ -83,13 +86,16 @@ const ALIASES: u32 = 1 << 16;
 /// then access the raw view it names (VIctory #193 and #704).
 struct Strides {
     table: StrideTable,
-    /// The first of the [`ALIASES`] slots, past the dynamic ones.
+    /// The first of the pool's slots, past the dynamic ones.
     alias_base: u32,
-    /// Shared with the holds of the recordings that read the table.
-    aliases: Arc<Mutex<Aliases>>,
+    aliases: Mutex<Aliases>,
 }
 
-/// An upload buffer of one 8-byte entry per heap slot, mapped for good.
+/// An upload buffer of one 8-byte entry per heap slot after a header,
+/// mapped for good: the header says how many entries follow and how many
+/// title slots the heap mirrors, for shaders to read only entries inside
+/// it ([`xtp_shader::emit::STRIDE_HEADER`]; the root SRV that binds it has
+/// no size).
 /// shortcut: shaders read it from system memory over PCIe (VIctory #704's
 /// testers measured frame times 7 to 11 % higher with the table); copy it
 /// to the card per submission if a session shows the reads cost.
@@ -103,9 +109,10 @@ struct StrideTable {
 }
 
 impl StrideTable {
-    /// A table of `len` entries of zeros (no view in any slot).
-    fn new(device: &ID3D12Device, len: u32) -> Option<StrideTable> {
-        let bytes = u64::from(len.max(1)) * u64::from(StrideEntry::BYTES);
+    /// A table of `len` entries of zeros (no view in any slot) for a heap
+    /// mirroring `mirrored` title slots.
+    fn new(device: &ID3D12Device, len: u32, mirrored: u32) -> Option<StrideTable> {
+        let bytes = u64::from(len + HEADER) * u64::from(StrideEntry::BYTES);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -121,8 +128,8 @@ impl StrideTable {
         };
         let mut resource: Option<ID3D12Resource> = None;
         let mut p = std::ptr::null_mut();
-        // SAFETY: a plain upload buffer, mapped for good; the zeros are
-        // written inside the mapping.
+        // SAFETY: a plain upload buffer, mapped for good; the zeros and the
+        // header are written inside the mapping.
         let made = unsafe {
             device
                 .CreateCommittedResource(
@@ -140,6 +147,9 @@ impl StrideTable {
                     let r = resource.as_ref().ok_or_else(windows::core::Error::empty)?;
                     r.Map(0, None, Some(&mut p))?;
                     std::ptr::write_bytes(p.cast::<u8>(), 0, bytes as usize);
+                    let header = p.cast::<u64>();
+                    header.write(u64::from(mirrored.min(len)) << 32);
+                    header.add(1).write(u64::from(len) << 32);
                     Ok(r.GetGPUVirtualAddress())
                 })
         };
@@ -158,39 +168,42 @@ impl StrideTable {
     }
 }
 
-/// The raw views of a heap's stride table, in the pool of [`ALIASES`]
-/// slots from [`Strides::alias_base`].
+/// The raw views of a heap's stride table, in a pool of slots from
+/// [`Strides::alias_base`] ([`ALIASES`] of them).
 ///
-/// A raw view the entries no longer name is not made again for another
-/// slot while a list that may still read through it has not run: each
-/// recording that reads the table holds the epoch it started at
-/// ([`StrideHold`]), and a raw view given back at epoch `e` comes back to
-/// the pool once no hold of an epoch up to `e` is left. A slot whose view
-/// changes keeps its raw view, rewritten in place with its entry, as the
-/// title's own descriptor is: the title rewrites its buffer views every
-/// frame (rings), and a new raw view for each change ran the pool out in
-/// half a minute of the world (stride-2: 65,536 taken, 49,829 retiring).
-/// The host buffer the old view read waits as a pool slot would, so a list
-/// in flight never reads freed memory.
+/// A slot whose view changes window gets another pool slot, made before
+/// its entry names it, and the old one retires: a submission the GPU may be
+/// running read the old entry (stride, bias, count) and then reads the old
+/// raw view, which must stay as it was (rewriting it in place, as before,
+/// gave such a submission the new window with the old stride and bias). A
+/// retired pool slot comes back once the host fence has reached the
+/// submission that was handed to the queue last when it retired
+/// ([`crate::host::Host::executing`]): later submissions read the table as
+/// it is after, so none of them reads it. It is made null then, and the
+/// host buffer it viewed goes. A recording that keeps a list for many
+/// submissions holds nothing (holds by recording pinned the pool for good
+/// before: stride-2, 65,536 taken, 49,829 retiring), so the retiring ones
+/// are those of the submissions in flight, at most the pool.
 #[derive(Default)]
 struct Aliases {
     /// The raw view of each slot that has one.
     of: HashMap<u32, Alias>,
-    /// Pool slots free now.
+    /// Pool slots free now (null views).
     free: Vec<u32>,
-    /// Pool slots given back, by epoch: the epoch, the pool slot (none for
-    /// a raw view rewritten in place), the host buffer it viewed (held
-    /// while a list may read through it).
-    retiring: VecDeque<(u64, Option<u32>, ID3D12Resource)>,
+    /// Pool slots no entry names any more, oldest first: the fence value
+    /// they wait for, the pool slot, whether it is an unordered view, and
+    /// the host buffer it viewed.
+    retiring: VecDeque<(u64, u32, bool, ID3D12Resource)>,
     /// Pool slots from here on were never taken.
     next: u32,
-    /// Raw views given back so far.
-    epoch: u64,
-    /// Recordings that read the table, by the epoch they started at.
-    holds: BTreeMap<u64, u32>,
+    /// The pool's slots ([`ALIASES`]; fewer in tests).
+    size: u32,
     /// Pool slots taken (named or retiring), and the most at once.
     used: u32,
     peak: u32,
+    /// Raw views a slot needed that the full pool did not give, since the
+    /// start.
+    refused: u64,
 }
 
 /// A slot's raw view: its pool slot, what it views (host buffer, first
@@ -201,96 +214,99 @@ struct Alias {
     buffer: ID3D12Resource,
 }
 
+/// What [`HostHeap::note_view`] did with a slot's entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Noted {
+    /// The heap has no table, or the slot holds no buffer view it names.
+    Nothing,
+    /// The entry names a raw view of the view's bytes.
+    Named,
+    /// The view needs a raw view the full pool did not give: none for now,
+    /// the slot is to be made again ([`Aliases`] gives one back once the
+    /// GPU is done with it).
+    Refused,
+}
+
+/// The host fence value a pool slot that retires now waits for, read after
+/// the entry no longer names it ([`crate::host::Host::executing`]); 0
+/// without a host (nothing runs).
+fn retire_ticket() -> u64 {
+    std::sync::atomic::fence(Ordering::SeqCst);
+    host().map_or(0, crate::host::Host::executing)
+}
+
+/// The host fence value the GPU has reached; everything without a host.
+fn completed() -> u64 {
+    host().map_or(u64::MAX, crate::host::Host::completed)
+}
+
 impl Aliases {
-    /// A free pool slot (taking back the retiring ones no hold may read),
-    /// and the host buffers of those, to drop after the lock.
-    fn take(&mut self) -> (Option<u32>, Vec<ID3D12Resource>) {
-        let oldest = self.holds.keys().next().copied();
-        let mut gone = Vec::new();
-        let mut freed = 0;
-        while let Some(&(epoch, pool, _)) = self.retiring.front() {
-            if oldest.is_some_and(|held| held <= epoch) {
-                break;
-            }
-            if let Some((_, _, buffer)) = self.retiring.pop_front() {
-                gone.push(buffer);
-            }
-            if let Some(pool) = pool {
-                self.free.push(pool);
-                freed += 1;
-            }
-        }
-        self.used -= freed;
+    /// A free pool slot, or none if every one is named or retiring.
+    fn take(&mut self) -> Option<u32> {
         let pool = self.free.pop().or_else(|| {
-            (self.next < ALIASES).then(|| {
+            (self.next < self.size).then(|| {
                 self.next += 1;
                 self.next - 1
             })
         });
-        if pool.is_some() {
-            self.used += 1;
-            if self.used > self.peak {
-                // Logged at each new eighth of the pool.
-                let eighth = |v: u32| v * 8 / ALIASES;
-                if eighth(self.used) > eighth(self.peak) {
-                    tracing::info!(
-                        peak = self.used,
-                        of = ALIASES,
-                        retiring = self.retiring.len(),
-                        "runtime stride table raw views: a new peak in use"
-                    );
-                }
-                self.peak = self.used;
-            }
+        if pool.is_none() {
+            self.refused += 1;
+            return None;
         }
-        (pool, gone)
+        self.used += 1;
+        if self.used > self.peak {
+            // Logged at each new eighth of the pool.
+            let eighth = |v: u32| u64::from(v) * 8 / u64::from(self.size.max(1));
+            if eighth(self.used) > eighth(self.peak) {
+                tracing::info!(
+                    peak = self.used,
+                    of = self.size,
+                    retiring = self.retiring.len(),
+                    "runtime stride table raw views: a new peak in use"
+                );
+            }
+            self.peak = self.used;
+        }
+        pool
     }
 
-    /// Gives `alias` back: retiring until the holds of now have gone.
-    fn retire(&mut self, alias: Alias) {
+    /// Gives `alias` back once the GPU has reached `ticket`.
+    fn retire(&mut self, alias: Alias, ticket: u64) {
         self.retiring
-            .push_back((self.epoch, Some(alias.pool), alias.buffer));
-        self.epoch += 1;
+            .push_back((ticket, alias.pool, alias.key.3, alias.buffer));
     }
 
-    /// Keeps `buffer`, which a raw view rewritten in place read, until the
-    /// holds of now have gone.
-    fn keep_retired(&mut self, buffer: ID3D12Resource) {
-        self.retiring.push_back((self.epoch, None, buffer));
-        self.epoch += 1;
-    }
-}
-
-/// A recording's hold on the raw views of its view heap's stride table: a
-/// raw view an entry named when the recording started to read the table,
-/// or later, is not made again for another slot until the hold goes, with
-/// the recording (after its submissions have run).
-pub(crate) struct StrideHold {
-    aliases: Arc<Mutex<Aliases>>,
-    epoch: u64,
-}
-
-// SAFETY: the host buffers the pool holds are D3D12 resources, which are
-// free-threaded; the rest is behind the mutex.
-unsafe impl Send for StrideHold {}
-
-impl Drop for StrideHold {
-    fn drop(&mut self) {
-        let mut a = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(n) = a.holds.get_mut(&self.epoch) {
-            *n -= 1;
-            if *n == 0 {
-                a.holds.remove(&self.epoch);
+    /// The retiring pool slots the GPU is done with at `completed`, out of
+    /// the queue: each to be made null, then free ([`HostHeap::reap`]).
+    fn done(&mut self, completed: u64) -> Vec<(u32, bool, ID3D12Resource)> {
+        let mut done = Vec::new();
+        while self
+            .retiring
+            .front()
+            .is_some_and(|&(ticket, ..)| ticket <= completed)
+        {
+            if let Some((_, pool, unordered, buffer)) = self.retiring.pop_front() {
+                done.push((pool, unordered, buffer));
             }
         }
+        done
     }
 }
+
+/// A recording's note that its shaders read a view heap's stride table
+/// (`draw.rs` keeps one per heap, with the table). It holds nothing: a raw
+/// view goes back to the pool once the GPU has run the submissions that
+/// may read it ([`Aliases`]), whichever recordings they came from.
+pub(crate) struct StrideHold;
 
 /// The bytes of its host copy a buffer view the host made reads, for the
-/// raw view of the runtime stride table ([`make_with`]).
+/// raw view of the runtime stride table ([`make_with`]) and the spans
+/// shaders that pick slots at run time read ([`Made::read`]).
 struct Viewed {
-    buffer: ID3D12Resource,
-    /// The view's first byte in the copy, and its bytes.
+    copy: Arc<Shadow>,
+    /// The title address of the view's first byte.
+    title: u64,
+    /// The view's first byte in the copy, and its bytes (cut to the copy).
     start: u64,
     len: u64,
     /// Bytes per element (4 for a raw view).
@@ -310,11 +326,139 @@ struct Made {
     textures: HashMap<u32, (usize, usize)>,
     /// Title slots whose buffer view waits for a draw (made null when the
     /// title wrote it), each once: [`HostHeap::picked_spans`] makes them.
+    /// With `XTP_RUN_TIME_VIEWS=1` only ([`run_time_views`]).
     waiting: Vec<u32>,
     queued: Vec<bool>,
-    /// The buffer views made in title slots: the title memory each reads
-    /// (address, bytes) and whether it is for unordered access.
-    buffers: HashMap<u32, (u64, u64, bool)>,
+    /// The buffer views made in title slots whose bytes a shader reads
+    /// (through the slot, or through the raw view the table names), with
+    /// `XTP_RUN_TIME_VIEWS=1` only: the title memory each reads, as cut to
+    /// its host copy.
+    buffers: HashMap<u32, Read>,
+    /// The same by host copy, for [`HostHeap::picked_spans`]: kept as the
+    /// views change, so that listing them is a step per copy.
+    spans: HashMap<usize, Spans>,
+    /// Changes to `buffers` so far.
+    changes: u64,
+}
+
+/// What a buffer view of a title slot reads ([`Made::buffers`]): its host
+/// copy (by address), the title memory `[from, to)` and whether it is for
+/// unordered access.
+#[derive(Clone, Copy)]
+struct Read {
+    copy: usize,
+    from: u64,
+    to: u64,
+    unordered: bool,
+}
+
+/// The views of one host copy ([`Made::spans`]), which they keep alive:
+/// their first and end addresses, counted, so that the span runs from the
+/// lowest to the highest whichever views go; and those of unordered views.
+struct Spans {
+    copy: Arc<Shadow>,
+    from: BTreeMap<u64, u32>,
+    to: BTreeMap<u64, u32>,
+    written_from: BTreeMap<u64, u32>,
+    written_to: BTreeMap<u64, u32>,
+}
+
+/// One more view at `at` in `counts`.
+fn count_in(counts: &mut BTreeMap<u64, u32>, at: u64) {
+    *counts.entry(at).or_default() += 1;
+}
+
+/// One less view at `at` in `counts`.
+fn count_out(counts: &mut BTreeMap<u64, u32>, at: u64) {
+    if let Some(n) = counts.get_mut(&at) {
+        *n -= 1;
+        if *n == 0 {
+            counts.remove(&at);
+        }
+    }
+}
+
+/// The span the first addresses `starts` and the end ones `ends` cover.
+fn span_of(starts: &BTreeMap<u64, u32>, ends: &BTreeMap<u64, u32>) -> Option<(u64, u64)> {
+    Some((*starts.keys().next()?, *ends.keys().next_back()?))
+}
+
+impl Made {
+    /// Title slot `index` now holds a buffer view whose bytes `viewed` are,
+    /// in place of what it held.
+    fn read(&mut self, index: u32, viewed: &Viewed) {
+        self.unread(index);
+        let copy = Arc::as_ptr(&viewed.copy) as usize;
+        let (from, to) = (viewed.title, viewed.title + viewed.len);
+        let s = self.spans.entry(copy).or_insert_with(|| Spans {
+            copy: viewed.copy.clone(),
+            from: BTreeMap::new(),
+            to: BTreeMap::new(),
+            written_from: BTreeMap::new(),
+            written_to: BTreeMap::new(),
+        });
+        count_in(&mut s.from, from);
+        count_in(&mut s.to, to);
+        if viewed.unordered {
+            count_in(&mut s.written_from, from);
+            count_in(&mut s.written_to, to);
+        }
+        let unordered = viewed.unordered;
+        self.buffers.insert(
+            index,
+            Read {
+                copy,
+                from,
+                to,
+                unordered,
+            },
+        );
+        self.changes += 1;
+    }
+
+    /// Title slot `index` holds no buffer view whose bytes a shader reads.
+    fn unread(&mut self, index: u32) {
+        let Some(r) = self.buffers.remove(&index) else {
+            return;
+        };
+        if let Some(s) = self.spans.get_mut(&r.copy) {
+            count_out(&mut s.from, r.from);
+            count_out(&mut s.to, r.to);
+            if r.unordered {
+                count_out(&mut s.written_from, r.from);
+                count_out(&mut s.written_to, r.to);
+            }
+            if s.from.is_empty() {
+                self.spans.remove(&r.copy);
+            }
+        }
+        self.changes += 1;
+    }
+
+    /// Title slot `index`'s buffer view waits for a sweep, if it does not
+    /// already.
+    fn wait(&mut self, index: u32) {
+        if let Some(queued) = self.queued.get_mut(index as usize)
+            && !*queued
+        {
+            *queued = true;
+            self.waiting.push(index);
+        }
+    }
+
+    /// What the views read and write, per host copy.
+    fn picked(&self) -> Picked {
+        let mut p = Picked::default();
+        for s in self.spans.values() {
+            if let Some((from, to)) = span_of(&s.from, &s.to) {
+                p.reads.push((s.copy.clone(), from, to));
+            }
+            if let Some((from, to)) = span_of(&s.written_from, &s.written_to) {
+                p.writes.push((s.copy.clone(), from, to));
+            }
+        }
+        p
+    }
 }
 
 /// What the buffer views of a heap's title slots read, for shaders that
@@ -323,10 +467,53 @@ struct Made {
 pub(crate) struct Picked {
     /// Per host copy, the span of title memory its views read.
     pub(crate) reads: Vec<(Arc<Shadow>, u64, u64)>,
+    /// Per host copy, the span its unordered views may write, for shaders
+    /// that write through slots they pick (`RUN_TIME_WRITES`): declared
+    /// written, it goes back to title memory after the submission, and no
+    /// refresh copies title memory over it meanwhile.
+    pub(crate) writes: Vec<(Arc<Shadow>, u64, u64)>,
 }
 
-/// How long a [`HostHeap::picked_spans`] pass makes waiting views for.
+/// How long a frame's [`HostHeap::picked_spans`] sweeps make host copies
+/// for waiting views: making one is a resource, which can wait in the
+/// kernel, and the world's loading leaves tens of thousands waiting. A view
+/// whose host copy is there is made whatever the time: a descriptor or
+/// two.
 const PICKED_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// The sweeps of a heap's buffer views for shaders that pick slots at run
+/// time ([`HostHeap::picked_spans`]).
+#[derive(Default)]
+struct Sweeps {
+    /// The frame of the last sweep, when its time began, and the time its
+    /// sweeps spent making host copies.
+    frame: u64,
+    began: Option<std::time::Instant>,
+    spent: std::time::Duration,
+    /// The last listing, and [`Made::changes`] when it was made.
+    listed: Option<(u64, Arc<Picked>)>,
+}
+
+/// Whether buffer views of title slots are kept for shaders that pick
+/// slots when they run (`XTP_RUN_TIME_VIEWS=1`,
+/// [`crate::device::run_time_views_on`]): the views the title writes wait
+/// for a sweep, and those made are listed by host copy. Off, nothing is
+/// kept, as before the switch. Tests set it per thread
+/// ([`RUN_TIME_VIEWS_TEST`]).
+fn run_time_views() -> bool {
+    #[cfg(test)]
+    if let Some(on) = RUN_TIME_VIEWS_TEST.get() {
+        return on;
+    }
+    crate::device::run_time_views_on()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`run_time_views`] for this thread's tests.
+    pub(crate) static RUN_TIME_VIEWS_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Dynamic slot bookkeeping.
 struct Slots {
@@ -446,6 +633,19 @@ impl HostHeap {
     /// ones, and counted in the host's cap.
     pub(crate) fn new_with(sampler: bool, count: u32, stride_table: bool) -> Option<Self> {
         let aliases = if sampler || !stride_table { 0 } else { ALIASES };
+        Self::new_pooled(sampler, count, aliases)
+    }
+
+    /// A view heap with a stride table whose pool has `aliases` raw views
+    /// (tests that fill it).
+    #[cfg(test)]
+    fn with_pool(count: u32, aliases: u32) -> Option<Self> {
+        Self::new_pooled(false, count, aliases)
+    }
+
+    /// [`HostHeap::new_with`] with `aliases` slots for the stride table's
+    /// raw views (0: no table).
+    fn new_pooled(sampler: bool, count: u32, aliases: u32) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -562,14 +762,17 @@ impl HostHeap {
             sampler,
         ));
         // Every slot of the heap has an entry: a shader reads the one of
-        // whatever slot it computes.
+        // whatever slot it computes, if it is inside the table.
         let strides = (aliases > 0)
-            .then(|| StrideTable::new(&host.device, total))
+            .then(|| StrideTable::new(&host.device, total, count))
             .flatten()
             .map(|table| Strides {
                 table,
                 alias_base: count + extra,
-                aliases: Arc::default(),
+                aliases: Mutex::new(Aliases {
+                    size: aliases,
+                    ..Aliases::default()
+                }),
             });
         let h = HostHeap {
             heap,
@@ -584,6 +787,8 @@ impl HostHeap {
                 waiting: Vec::new(),
                 queued: vec![false; if sampler { 0 } else { count as usize }],
                 buffers: HashMap::new(),
+                spans: HashMap::new(),
+                changes: 0,
             }),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             slots: Mutex::new(Slots {
@@ -595,7 +800,7 @@ impl HostHeap {
             shared: Mutex::default(),
             null_raw: OnceLock::new(),
             strides,
-            picked: Mutex::new(None),
+            picked: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -957,8 +1162,9 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         // (A view the host could not make may still give the table its
-        // bytes: `off_element_view`.)
-        self.note_view(index, viewed);
+        // bytes: `off_element_view`. A view the full pool gives no raw view
+        // is made again with the next fresh table.)
+        self.note_view(index, viewed.as_ref());
         self.keep(index, kept.flatten());
         made
     }
@@ -1040,6 +1246,12 @@ impl HostHeap {
         self.keep(index, Some(buffer.clone()));
     }
 
+    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, window: RawWindow) {
+        raw_view(buffer, window, true, self.cpu(index));
+        self.forget_view(index);
+        self.keep(index, Some(buffer.clone()));
+    }
+
     /// Makes slot `index` a raw buffer view that reads zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
         null_buffer_view(self.cpu(index));
@@ -1073,7 +1285,34 @@ impl HostHeap {
     /// resident, replaced: #643) is not the title's doing, and such lists
     /// may read the view before or after (both of the same kind: a null
     /// view is made in the title's dimension).
+    ///
+    /// The record's three words are read without a lock while another
+    /// thread may be publishing one there (the title's view creation and
+    /// descriptor copies, which call this after their write): the slot is
+    /// made only if they still hold what was read once its lock is taken,
+    /// else read again ([`MIRROR_TRIES`] times, then left to the writer's
+    /// own call). A record read before the write is never made after it.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        for _ in 0..MIRROR_TRIES {
+            match self.mirror_once(index, handle, for_draw, true) {
+                Ok(view) => return view,
+                Err(Unmade::Rewritten) => continue,
+                Err(Unmade::NoCopy) => return None,
+            }
+        }
+        None
+    }
+
+    /// One try of [`HostHeap::mirror`]; with `copies` false, a buffer view
+    /// whose host copy is not made yet is left as it is (`NoCopy`: a sweep
+    /// out of time, [`HostHeap::picked_spans`]).
+    fn mirror_once(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        copies: bool,
+    ) -> Result<Option<View>, Unmade> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): title slots past the host heap,
             // which are not mirrored, counted apart for the title's writes
@@ -1095,10 +1334,10 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            return Ok(None);
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let header = header_at(handle);
+        let [tag, i, generation] = header;
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
@@ -1154,9 +1393,21 @@ impl HostHeap {
             && let Some((address, len)) = resolved.and_then(copy_range)
             && stale(&self.made.lock().unwrap_or_else(|e| e.into_inner()))
         {
-            let _ = crate::shadow::find(address, len);
+            if copies {
+                let _ = crate::shadow::find(address, len);
+            } else if crate::shadow::existing(address, len).is_none() {
+                return Err(Unmade::NoCopy);
+            }
+        }
+        #[cfg(test)]
+        if let Some(between) = BETWEEN.with(|b| b.borrow_mut().take()) {
+            between();
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if header_at(handle) != header {
+            // Published meanwhile.
+            return Err(Unmade::Rewritten);
+        }
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
@@ -1170,13 +1421,13 @@ impl HostHeap {
                     null_view(self.cpu(index));
                 }
                 self.forget_view(index);
-                made.buffers.remove(&index);
+                made.unread(index);
                 old = self.swap_kept(index, None);
             }
             // A host resource the slot held goes after the lock.
             drop(made);
             drop(old);
-            return None;
+            return Ok(None);
         };
         let mut old = None;
         if stale(&made) {
@@ -1188,13 +1439,9 @@ impl HostHeap {
             // view of a texture the title placed itself would make a host
             // texture over memory the title may be drawing a target in, and
             // constant buffer views are no buffer a raw read can take.
-            let waits = later && buffer_range(view).is_some();
-            if waits
-                && let Some(queued) = made.queued.get_mut(index as usize)
-                && !*queued
-            {
-                *queued = true;
-                made.waiting.push(index);
+            let picking = run_time_views();
+            if later && picking && buffer_range(view).is_some() {
+                made.wait(index);
             }
             match texture {
                 Some(t) if !later => made.textures.insert(index, t),
@@ -1204,28 +1451,39 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                let wanted = self.strides.is_some().then_some(&mut viewed);
+                let wanted = (self.strides.is_some() || picking).then_some(&mut viewed);
                 make_with(view, self.cpu(index), wanted)
             };
             if kept.is_none() && !self.sampler {
                 null_for(view, self.cpu(index));
             }
             // The entry with the descriptor, under the same lock.
-            self.note_view(index, viewed);
-            match buffer_range(view).filter(|&(_, len)| kept.is_some() && len > 0) {
-                Some((address, len)) => {
-                    let unordered = matches!(view, View::Unordered(..) | View::Placed(true, ..));
-                    made.buffers.insert(index, (address, len, unordered));
+            let noted = self.note_view(index, viewed.as_ref());
+            if noted == Noted::Refused {
+                // No raw view for the table now: the slot is made again by
+                // the next draw that reads it, or the next sweep, which
+                // finds one once the GPU has given one back.
+                made.keys[index as usize] = 0;
+                if picking {
+                    made.wait(index);
                 }
-                None => {
-                    made.buffers.remove(&index);
-                }
+            }
+            // What a shader that picks the slot at run time reads: the
+            // bytes the slot's view or the table's raw view reads, as cut
+            // to the host copy (a view the host leaves null may have the
+            // latter).
+            let read = viewed
+                .as_ref()
+                .filter(|v| picking && v.len > 0 && (kept.is_some() || noted == Noted::Named));
+            match read {
+                Some(v) => made.read(index, v),
+                None => made.unread(index),
             }
             old = self.swap_kept(index, kept.flatten());
         }
         drop(made);
         drop(old);
-        Some(placed.flatten().unwrap_or(view))
+        Ok(Some(placed.flatten().unwrap_or(view)))
     }
 
     /// The resource made for the memory of the texture the title placed
@@ -1261,6 +1519,34 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// Tries of [`HostHeap::mirror`] at a slot published meanwhile each time.
+const MIRROR_TRIES: u32 = 4;
+
+/// Why [`HostHeap::mirror_once`] made nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unmade {
+    /// Another thread published a record in the slot meanwhile.
+    Rewritten,
+    /// The view's host copy is not made yet, and this try may not make it.
+    NoCopy,
+}
+
+/// The record header the title has at `handle`: tag, view index and
+/// generation.
+fn header_at(handle: u64) -> [u32; 3] {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    unsafe { (handle as *const [u32; 3]).read_unaligned() }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once by the next [`HostHeap::mirror`] on this thread, between
+    /// reading the slot's record and taking the slot lock (tests: another
+    /// thread publishing a record then).
+    static BETWEEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Logs `what` the first time it happens.
@@ -1332,14 +1618,23 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         }
         _ => return None,
     };
-    let desc = srv_desc(words);
+    let mut desc = srv_desc(words);
+    desc.Format = DXGI_FORMAT(words[0] as i32);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { desc.Anonymous.Buffer };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    range_of(base, buffer.FirstElement, buffer.NumElements, element)
+}
+
+/// The title memory of `elements` elements of `element` bytes from element
+/// `first` of memory at `base`: none if it cannot be represented (a title
+/// description out of range, read from an `extern "system"` call, where an
+/// overflow would end the process or wrap around).
+fn range_of(base: u64, first: u64, elements: u32, element: u64) -> Option<(u64, u64)> {
+    let start = base.checked_add(first.checked_mul(element)?)?;
+    let len = u64::from(elements).checked_mul(element)?;
+    start.checked_add(len)?;
+    Some((start, len))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -1352,12 +1647,9 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
     } else {
-        crate::resource::element(desc.Format.0 as u32)?.0
+        crate::resource::element(words[0])?.0
     };
-    Some((
-        base + buffer.FirstElement * element,
-        u64::from(buffer.NumElements) * element,
-    ))
+    range_of(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
 impl HostHeap {
@@ -1369,17 +1661,41 @@ impl HostHeap {
             .map(|s| (s.table.gpu, &s.table.resource))
     }
 
-    /// A hold for a recording that reads the stride table ([`StrideHold`]);
-    /// none if the heap has no table.
+    /// A note for a recording that reads the stride table ([`StrideHold`]);
+    /// none if the heap has no table. The raw views the GPU is done with go
+    /// back to the pool now (as they do whenever one is taken or retires).
     pub(crate) fn stride_hold(&self) -> Option<StrideHold> {
         let s = self.strides.as_ref()?;
         let mut a = s.aliases.lock().unwrap_or_else(|e| e.into_inner());
-        let epoch = a.epoch;
-        *a.holds.entry(epoch).or_default() += 1;
-        Some(StrideHold {
-            aliases: s.aliases.clone(),
-            epoch,
-        })
+        let gone = self.reap(s, &mut a);
+        drop(a);
+        drop(gone);
+        Some(StrideHold)
+    }
+
+    /// Gives the retiring raw views the GPU is done with back to the pool,
+    /// each made null first: no submission reads it any more, and a stale
+    /// read of the slot would otherwise find a view of a buffer that went.
+    /// Returns their host buffers, to drop after the lock (a last reference
+    /// may free video memory, which can wait).
+    fn reap(&self, s: &Strides, a: &mut Aliases) -> Vec<ID3D12Resource> {
+        if a.retiring.is_empty() {
+            return Vec::new();
+        }
+        let done = a.done(completed());
+        let mut gone = Vec::with_capacity(done.len());
+        for (pool, unordered, buffer) in done {
+            let at = self.cpu(s.alias_base + pool);
+            if unordered {
+                null_raw_uav(at);
+            } else {
+                null_buffer_view(at);
+            }
+            a.free.push(pool);
+            a.used -= 1;
+            gone.push(buffer);
+        }
+        gone
     }
 
     /// Writes slot `index`'s table entry, in one 64-bit store: a shader
@@ -1394,8 +1710,11 @@ impl HostHeap {
             once!(?entry, "a stride table entry the table cannot hold: none");
             0
         });
-        // SAFETY: an 8-byte aligned entry inside the live mapping.
-        let at = unsafe { AtomicU64::from_ptr((s.table.ptr as *mut u64).add(index as usize)) };
+        // SAFETY: an 8-byte aligned entry inside the live mapping, past
+        // the header.
+        let at = unsafe {
+            AtomicU64::from_ptr((s.table.ptr as *mut u64).add((index + HEADER) as usize))
+        };
         at.store(bits, Ordering::Release);
     }
 
@@ -1404,11 +1723,16 @@ impl HostHeap {
     /// view, or one the host could not make). A raw view is read in its own
     /// slot; a structured or typed one through a raw view of the same bytes
     /// in the pool, made before the entry names it. A slot whose view
-    /// changed keeps its pool slot, rewritten in place ([`Aliases`]).
-    fn note_view(&self, index: u32, viewed: Option<Viewed>) {
-        let Some(s) = &self.strides else { return };
+    /// changes window gets another raw view, and the old one retires until
+    /// the GPU has run what may read it ([`Aliases`]); one whose window
+    /// stays keeps its raw view, untouched.
+    fn note_view(&self, index: u32, viewed: Option<&Viewed>) -> Noted {
+        let Some(s) = &self.strides else {
+            return Noted::Nothing;
+        };
         let Some(v) = viewed else {
-            return self.forget_view(index);
+            self.forget_view(index);
+            return Noted::Nothing;
         };
         if v.raw {
             self.set_entry(
@@ -1420,11 +1744,13 @@ impl HostHeap {
                     count: u32::try_from(v.len / 4).unwrap_or(u32::MAX),
                 },
             );
-            return self.retire_alias(s, index);
+            self.retire_alias(s, index);
+            return Noted::Named;
         }
         let element = u32::try_from(v.element).unwrap_or(0);
-        let window = RawWindow::covering(v.start, v.len)
-            .filter(|_| element.is_multiple_of(4) && element <= StrideEntry::MAX_STRIDE);
+        let window = RawWindow::covering(v.start, v.len).filter(|_| {
+            element > 0 && element.is_multiple_of(4) && element <= StrideEntry::MAX_STRIDE
+        });
         let Some(window) = window else {
             // shortcut: a view starting off a dword of its host copy, or of
             // elements no entry holds, is read through the table as no view.
@@ -1433,90 +1759,87 @@ impl HostHeap {
                 element,
                 "a buffer view the stride table cannot name a raw view for: read as none"
             );
-            return self.forget_view(index);
+            self.forget_view(index);
+            return Noted::Nothing;
         };
+        let buffer = &v.copy.buffer;
         let key = (
-            v.buffer.as_raw() as usize,
+            buffer.as_raw() as usize,
             window.first,
             window.dwords,
             v.unordered,
         );
         let count = (v.len / v.element).min(u64::from(window.elements(element))) as u32;
+        let entry = |pool: u32| StrideEntry {
+            stride: element,
+            raw_slot: Some(s.alias_base + pool),
+            bias: window.bias,
+            count,
+        };
         let mut a = s.aliases.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = a.of.get_mut(&index) {
+        if let Some(old) = a.of.get(&index)
+            && old.key == key
+        {
+            // The same raw view: a submission in flight that read the old
+            // entry reads the same bytes through it.
             let pool = old.pool;
-            if old.key != key {
-                // Another view: its raw view in the same pool slot, made
-                // before the entry says so; the buffer the old one read
-                // stays while a list in flight may read through it.
-                raw_view(
-                    &v.buffer,
-                    window,
-                    v.unordered,
-                    self.cpu(s.alias_base + pool),
-                );
-                old.key = key;
-                let read = std::mem::replace(&mut old.buffer, v.buffer.clone());
-                a.keep_retired(read);
-            }
             drop(a);
-            return self.set_entry(
-                index,
-                StrideEntry {
-                    stride: element,
-                    raw_slot: Some(s.alias_base + pool),
-                    bias: window.bias,
-                    count,
-                },
-            );
+            self.set_entry(index, entry(pool));
+            return Noted::Named;
         }
-        let (pool, gone) = a.take();
-        let Some(pool) = pool else {
+        let gone = self.reap(s, &mut a);
+        let Some(pool) = a.take() else {
+            let refused = a.refused;
             drop(a);
             drop(gone);
-            once!(
-                of = ALIASES,
-                "no free raw view slots for the stride table: a buffer read through it reads zeros"
-            );
-            return self.forget_view(index);
+            if refused.is_power_of_two() {
+                tracing::warn!(
+                    refused,
+                    of = s.table.len,
+                    "no free raw view slots for the stride table: a buffer read through it \
+                     reads zeros until one is given back"
+                );
+            }
+            self.forget_view(index);
+            return Noted::Refused;
         };
-        let slot = s.alias_base + pool;
-        raw_view(&v.buffer, window, v.unordered, self.cpu(slot));
-        a.of.insert(
+        raw_view(buffer, window, v.unordered, self.cpu(s.alias_base + pool));
+        let old = a.of.insert(
             index,
             Alias {
                 pool,
                 key,
-                buffer: v.buffer.clone(),
+                buffer: buffer.clone(),
             },
         );
-        self.set_entry(
-            index,
-            StrideEntry {
-                stride: element,
-                raw_slot: Some(slot),
-                bias: window.bias,
-                count,
-            },
-        );
+        self.set_entry(index, entry(pool));
+        if let Some(old) = old {
+            a.retire(old, retire_ticket());
+        }
         drop(a);
         drop(gone);
+        Noted::Named
     }
 
     /// Slot `index` holds no view shaders read through the stride table:
-    /// its entry says none, then its raw view is given back.
+    /// its entry says none, then its raw view retires.
     fn forget_view(&self, index: u32) {
         let Some(s) = &self.strides else { return };
         self.set_entry(index, StrideEntry::NONE);
         self.retire_alias(s, index);
     }
 
-    /// Gives back slot `index`'s raw view, if it has one.
+    /// Retires slot `index`'s raw view, if it has one (its entry no longer
+    /// names it).
     fn retire_alias(&self, s: &Strides, index: u32) {
         let mut a = s.aliases.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = a.of.remove(&index) {
-            a.retire(old);
-        }
+        let Some(old) = a.of.remove(&index) else {
+            return;
+        };
+        a.retire(old, retire_ticket());
+        let gone = self.reap(s, &mut a);
+        drop(a);
+        drop(gone);
     }
 
     /// [`HostHeap::forget_view`] for each slot of `ranges` (dynamic slots
@@ -1532,42 +1855,67 @@ impl HostHeap {
         if a.of.is_empty() {
             return;
         }
+        let ticket = retire_ticket();
         for &(first, n) in ranges {
             for index in first..first.saturating_add(n).min(s.alias_base) {
                 if let Some(old) = a.of.remove(&index) {
-                    a.retire(old);
+                    a.retire(old, ticket);
                 }
             }
         }
     }
 
-    /// What the buffer views of the title's slots read, with every buffer
-    /// view the title wrote made first, for a shader that picks the slots
-    /// it reads when it runs (no used-resource entry names them, so no
-    /// draw's table made their views: they were null views, read as zeros;
-    /// VIctory #71, watch.md item 170). `start` is the title heap's first
-    /// descriptor. Made at most once a frame per heap, by the first list of
-    /// the frame that asks (none for the others: `None`): views the title
-    /// writes later in the frame, and what it writes in their memory, wait
-    /// for the next one. Title memory that is not write-watched is copied
-    /// whole by each refresh, which per list made the pass cost seconds a
-    /// frame (fxceless's VIctory fork, 578d459: 18 s a frame per list,
-    /// some 30 ms once a frame).
+    /// What the buffer views of the title's slots read and write, for a
+    /// shader that picks the slots it reads when it runs (no used-resource
+    /// entry names them, so no draw's table made their views: they were
+    /// null views, read as zeros; VIctory #71, watch.md item 170), with the
+    /// buffer views the title wrote since the last call made first. `start`
+    /// is the title heap's first descriptor. `None` without
+    /// `XTP_RUN_TIME_VIEWS=1` ([`run_time_views`]).
+    ///
+    /// Every draw or dispatch that binds such a shader calls it (`draw.rs`
+    /// `picked_buffers`), and each list refreshes what it lists for its
+    /// own submission: whichever list the title submits first, or drops,
+    /// each reads the title memory of its own submission (a sweep once a
+    /// frame for the frame's first list left the others the frame before's,
+    /// and views written after it null). A view whose host copy is made is
+    /// made at once, whatever the time: a descriptor or two. Making host
+    /// copies (resources, which can wait in the kernel: the world's loading
+    /// leaves tens of thousands of views waiting) takes [`PICKED_BUDGET`]
+    /// at most a frame, one at least per call; views past it stay null
+    /// until a later call makes their copy, in the order the title wrote
+    /// them. The listing is kept as views change ([`Made::spans`]): a step
+    /// per host copy, and none when nothing changed.
+    /// shortcut: a view the title writes after the last such draw of a list
+    /// is recorded, before the list runs, is made at the next such draw;
+    /// that list's shaders read it null (the console reads descriptors when
+    /// the GPU runs). A sweep at submission would take it.
     ///
     /// The approach of Marvisak/VIctory#1544 (n-romanovich): views written
     /// by the title made before a draw that reads the heap directly, their
-    /// title memory brought up to date. Here the slots that waited are
-    /// made once (not every slot that ever held a view, at each change of
-    /// the heap), the spans are merged per host copy, and the views go
-    /// through the checks a host view must pass (`fit_view`), so that a bad
-    /// record makes a null view rather than remove the device.
+    /// title memory brought up to date. Here only the slots that waited are
+    /// made (not every slot that ever held a view, at each change of the
+    /// heap), the spans are merged per host copy (fxceless's VIctory fork,
+    /// 578d459, refreshed each view's memory per list: 18 s a frame), and
+    /// the views go through the checks a host view must pass (`fit_view`),
+    /// so that a bad record makes a null view rather than remove the
+    /// device.
     pub(crate) fn picked_spans(&self, start: u64) -> Option<Arc<Picked>> {
-        let frame = crate::frame::current();
-        let mut picked = self.picked.lock().unwrap_or_else(|e| e.into_inner());
-        if picked.as_ref().is_some_and(|(at, _)| *at == frame) {
+        if !run_time_views() || self.sampler {
             return None;
         }
+        let frame = crate::frame::current();
         let started = std::time::Instant::now();
+        let mut sweeps = self.picked.lock().unwrap_or_else(|e| e.into_inner());
+        // A frame's time, or [`PASS_AGAIN`]'s where frames do not advance.
+        let again = sweeps
+            .began
+            .is_none_or(|at| started.saturating_duration_since(at) >= PASS_AGAIN);
+        if sweeps.frame != frame || again {
+            sweeps.frame = frame;
+            sweeps.began = Some(started);
+            sweeps.spent = std::time::Duration::ZERO;
+        }
         let waiting = {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let waiting = std::mem::take(&mut made.waiting);
@@ -1578,84 +1926,82 @@ impl HostHeap {
             }
             waiting
         };
-        // Within a budget a pass: each view may need a host copy made (a
-        // resource, which can wait in the kernel), and the world's loading
-        // leaves tens of thousands waiting. Those past it wait for the next
-        // frames' passes, in the order the title wrote them. One view a pass
-        // at least, however long the thread waited before it (the lock, or
-        // a loaded machine): a pass always makes progress, and n views that
-        // wait are made within n passes.
-        let mut made_now = 0u32;
+        // Those whose host copy is there first, then those that need one,
+        // in the order the title wrote them, while the frame's time lasts.
         let mut left = Vec::new();
-        for (n, &index) in waiting.iter().enumerate() {
-            if n > 0 && started.elapsed() > PICKED_BUDGET {
-                left.extend_from_slice(&waiting[n..]);
+        let mut copied = 0u32;
+        for &index in &waiting {
+            let handle = start + u64::from(index) * 32;
+            if self.mirror_tries(index, handle, false) == Err(Unmade::NoCopy) {
+                left.push(index);
+            }
+        }
+        // The frame's first copy whatever it costs: n views wait n frames
+        // at most.
+        let mut postponed = Vec::new();
+        for (n, &index) in left.iter().enumerate() {
+            if sweeps.spent >= PICKED_BUDGET {
+                postponed.extend_from_slice(&left[n..]);
                 break;
             }
-            if self
-                .mirror(index, start + u64::from(index) * 32, true)
-                .is_some()
-            {
-                made_now += 1;
-            }
+            let copy_started = std::time::Instant::now();
+            let _ = self.mirror_tries(index, start + u64::from(index) * 32, true);
+            sweeps.spent += copy_started.elapsed();
+            copied += 1;
         }
-        if !left.is_empty() {
+        if !postponed.is_empty() {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for &index in &left {
-                if let Some(queued) = made.queued.get_mut(index as usize)
-                    && !*queued
-                {
-                    *queued = true;
-                    made.waiting.push(index);
-                }
+            for &index in &postponed {
+                made.wait(index);
             }
         }
-        let ranges: Vec<(u64, u64, bool)> = self
-            .made
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .buffers
-            .values()
-            .copied()
-            .collect();
-        let mut spans: HashMap<usize, (Arc<Shadow>, u64, u64)> = HashMap::new();
-        let mut unordered_views = 0usize;
-        for (address, len, unordered) in ranges.iter().copied() {
-            let Some(copy) = crate::shadow::existing(address, len) else {
-                continue;
-            };
-            let span = spans
-                .entry(Arc::as_ptr(&copy) as usize)
-                .or_insert_with(|| (copy.clone(), address, address + len));
-            span.1 = span.1.min(address);
-            span.2 = span.2.max(address + len);
-            unordered_views += usize::from(unordered);
-        }
-        let p = Arc::new(Picked {
-            reads: spans.into_values().collect(),
-        });
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let changes = made.changes;
+        let p = match &sweeps.listed {
+            Some((at, p)) if *at == changes => p.clone(),
+            _ => {
+                let p = Arc::new(made.picked());
+                sweeps.listed = Some((changes, p.clone()));
+                p
+            }
+        };
+        let views = made.buffers.len();
+        drop(made);
         static PASSES: AtomicU64 = AtomicU64::new(0);
         let passes = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
-        if passes.is_power_of_two() {
+        if passes.is_power_of_two() || !postponed.is_empty() && passes.is_multiple_of(256) {
             let bytes: u64 = p.reads.iter().map(|(_, from, to)| to - from).sum();
             tracing::info!(
                 passes,
                 waited = waiting.len(),
-                made = made_now,
-                left = left.len(),
-                views = ranges.len(),
+                copies_made = copied,
+                left = postponed.len(),
+                views,
                 copies = p.reads.len(),
+                written = p.writes.len(),
                 mib = bytes >> 20,
-                unordered = unordered_views,
                 us = started.elapsed().as_micros() as u64,
+                frame_copy_us = sweeps.spent.as_micros() as u64,
                 "buffer views of slots picked at run time: made and listed"
             );
         }
-        *picked = Some((frame, p.clone()));
         Some(p)
     }
 
-    /// Title slots whose buffer view waits for a pass (tests).
+    /// [`HostHeap::mirror`] for a draw, `copies` as for
+    /// [`HostHeap::mirror_once`].
+    fn mirror_tries(&self, index: u32, handle: u64, copies: bool) -> Result<(), Unmade> {
+        for _ in 0..MIRROR_TRIES {
+            match self.mirror_once(index, handle, true, copies) {
+                Ok(_) => return Ok(()),
+                Err(Unmade::Rewritten) => continue,
+                Err(Unmade::NoCopy) => return Err(Unmade::NoCopy),
+            }
+        }
+        Err(Unmade::Rewritten)
+    }
+
+    /// Title slots whose buffer view waits for a sweep (tests).
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
         self.made
@@ -1665,12 +2011,12 @@ impl HostHeap {
             .len()
     }
 
-    /// Forgets this frame's [`HostHeap::picked_spans`] pass, so that the
-    /// next call makes one, as the first list of a new frame does (tests:
-    /// the frame count is the process's, and other tests count it).
+    /// Starts the frame's time for [`HostHeap::picked_spans`] afresh, as a
+    /// new frame does (tests: the frame count is the process's, and other
+    /// tests count it).
     #[cfg(test)]
     pub(crate) fn forget_picked_pass(&self) {
-        *self.picked.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.picked.lock().unwrap_or_else(|e| e.into_inner()).spent = std::time::Duration::ZERO;
     }
 
     /// Slot `index`'s table entry (tests).
@@ -1679,14 +2025,33 @@ impl HostHeap {
         let s = self.strides.as_ref().expect("a stride table");
         assert!(index < s.table.len);
         // SAFETY: as in `set_entry`.
-        let at = unsafe { AtomicU64::from_ptr((s.table.ptr as *mut u64).add(index as usize)) };
+        let at = unsafe {
+            AtomicU64::from_ptr((s.table.ptr as *mut u64).add((index + HEADER) as usize))
+        };
         StrideEntry::from_bits(at.load(Ordering::Acquire))
+    }
+
+    /// The table's header words: title slots mirrored, entries (tests).
+    #[cfg(test)]
+    fn table_header(&self) -> (u32, u32) {
+        let s = self.strides.as_ref().expect("a stride table");
+        // SAFETY: the header, inside the live mapping.
+        let words = unsafe { (s.table.ptr as *const [u64; 2]).read() };
+        ((words[0] >> 32) as u32, (words[1] >> 32) as u32)
     }
 
     /// The first slot of the raw views' pool (tests).
     #[cfg(test)]
     pub(crate) fn alias_base(&self) -> u32 {
         self.strides.as_ref().expect("a stride table").alias_base
+    }
+
+    /// Pool slots retiring, and free or never taken (tests).
+    #[cfg(test)]
+    fn pool_state(&self) -> (usize, u32) {
+        let s = self.strides.as_ref().expect("a stride table");
+        let a = s.aliases.lock().unwrap_or_else(|e| e.into_inner());
+        (a.retiring.len(), a.free.len() as u32 + (a.size - a.next))
     }
 }
 
@@ -2560,11 +2925,13 @@ fn off_16(start: u64, element: u64) {
 /// to the runtime stride table, whose raw views start on any dword, and
 /// with `XTP_RAW_STRUCTURED=1` the slot gets a raw view of them where they
 /// start on 16 bytes. Else the slot is made null, as before, and counted.
+/// `origin`: the title address of the copy's first byte.
 /// The idea of five-star-recomp's 955a679 and 7bd1ca8 (watch.md item 201:
 /// such a view becomes a raw view at its byte, not a null one), written
 /// anew.
 fn off_element_view(
     copy: &Arc<Shadow>,
+    origin: u64,
     (start, elements, element): (u64, u32, u64),
     unordered: bool,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
@@ -2583,7 +2950,8 @@ fn off_element_view(
     let len = fit * element;
     if let Some(v) = viewed {
         *v = Some(Viewed {
-            buffer: copy.buffer.clone(),
+            copy: copy.clone(),
+            title: origin + start,
             start,
             len,
             element,
@@ -2624,6 +2992,13 @@ fn off_element_view(
 /// wholly inside its copy; it reads the bytes the console reads, and zeros
 /// past the copy (D3D12's bounds), where a null view would read zeros for
 /// the valid part too, the very failure of the culling's zero reads.
+///
+/// With `XTP_STRIDE_TABLE` and `XTP_RUN_TIME_VIEWS` off too, though it was
+/// not so before stride's landing (54ab53d; Codex's review asked): every
+/// view it changes is one the host refuses as described (the debug layer
+/// says so; without it the descriptor is undefined, or the device goes),
+/// so no view the host made before is made otherwise. So for
+/// [`repair_format`].
 fn fit_view(
     copy: &ID3D12Resource,
     first: u64,
@@ -2692,12 +3067,21 @@ fn buffer_srv(
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let offset = shadow.offset(address);
+    // The title address of the copy's first byte.
+    let origin = address - offset;
     if element == 0 || offset % element != 0 {
-        let start = offset + buffer.FirstElement * element;
+        let start = offset.checked_add(buffer.FirstElement.checked_mul(element)?)?;
         let elements = buffer.NumElements;
-        return off_element_view(&shadow, (start, elements, element), false, at, viewed);
+        return off_element_view(
+            &shadow,
+            origin,
+            (start, elements, element),
+            false,
+            at,
+            viewed,
+        );
     }
-    buffer.FirstElement += offset / element;
+    buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
     let shape = (buffer.StructureByteStride, format, raw);
     fit_view(
@@ -2708,9 +3092,11 @@ fn buffer_srv(
         shape,
     )?;
     if let Some(v) = viewed {
+        let start = buffer.FirstElement * element;
         *v = Some(Viewed {
-            buffer: shadow.buffer.clone(),
-            start: buffer.FirstElement * element,
+            copy: shadow.clone(),
+            title: origin + start,
+            start,
             len: u64::from(buffer.NumElements) * element,
             element,
             raw,
@@ -2804,12 +3190,21 @@ fn buffer_uav(
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
     let offset = shadow.offset(address);
+    // The title address of the copy's first byte.
+    let origin = address - offset;
     if element == 0 || offset % element != 0 {
-        let start = offset + buffer.FirstElement * element;
+        let start = offset.checked_add(buffer.FirstElement.checked_mul(element)?)?;
         let elements = buffer.NumElements;
-        return off_element_view(&shadow, (start, elements, element), true, at, viewed);
+        return off_element_view(
+            &shadow,
+            origin,
+            (start, elements, element),
+            true,
+            at,
+            viewed,
+        );
     }
-    buffer.FirstElement += offset / element;
+    buffer.FirstElement = buffer.FirstElement.checked_add(offset / element)?;
     buffer.CounterOffsetInBytes = 0;
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
     let shape = (buffer.StructureByteStride, format, raw);
@@ -2821,9 +3216,11 @@ fn buffer_uav(
         shape,
     )?;
     if let Some(v) = viewed {
+        let start = buffer.FirstElement * element;
         *v = Some(Viewed {
-            buffer: shadow.buffer.clone(),
-            start: buffer.FirstElement * element,
+            copy: shadow.clone(),
+            title: origin + start,
+            start,
             len: u64::from(buffer.NumElements) * element,
             element,
             raw,
@@ -3268,6 +3665,31 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// A raw unordered access buffer view that reads zeros and drops writes.
+fn null_raw_uav(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device.CreateUnorderedAccessView(
+            None::<&ID3D12Resource>,
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
+    };
+}
+
 /// A texture view that reads zeros with the dimension (and mip and array
 /// counts) of the title's description `words`; 2D if it names none.
 fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
@@ -3340,18 +3762,28 @@ mod tests {
         // SAFETY: a live buffer.
         let width = unsafe { copy.buffer.GetDesc() }.Width;
         // Four elements of 12 bytes from byte 20 (not on an element).
+        let origin = buffer.address() - copy.offset(buffer.address());
         let mut viewed = None;
-        let made = off_element_view(&copy, (20, 4, 12), false, heap.cpu(3), Some(&mut viewed));
-        assert!(made.is_none(), "the slot stays null without the switch");
+        let made = off_element_view(
+            &copy,
+            origin,
+            (20, 4, 12),
+            false,
+            heap.cpu(3),
+            Some(&mut viewed),
+        );
+        assert!(made.is_none(), "null: no raw view starts at byte 20");
         let v = viewed.as_ref().expect("its bytes");
         assert_eq!((v.start, v.len, v.element), (20, 48, 12));
-        heap.note_view(3, viewed);
+        assert_eq!(v.title, origin + 20);
+        assert_eq!(heap.note_view(3, viewed.as_ref()), Noted::Named);
         let entry = heap.entry(3);
         assert_eq!((entry.stride, entry.bias, entry.count), (12, 4, 4));
         // Running past the copy: cut to the elements that fit.
         let mut viewed = None;
         off_element_view(
             &copy,
+            origin,
             (width - 28, 4, 12),
             false,
             heap.cpu(4),
@@ -3360,7 +3792,14 @@ mod tests {
         assert_eq!(viewed.map(|v| v.len), Some(24));
         // Off a dword: nothing a raw view could read.
         let mut viewed = None;
-        off_element_view(&copy, (22, 4, 12), false, heap.cpu(5), Some(&mut viewed));
+        off_element_view(
+            &copy,
+            origin,
+            (22, 4, 12),
+            false,
+            heap.cpu(5),
+            Some(&mut viewed),
+        );
         assert!(viewed.is_none());
     }
 
@@ -4043,6 +4482,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn three_byte_views_keep_their_title_range_in_both_directions() {
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        for format in 118..=120 {
+            for unordered in [false, true] {
+                let mut words = [0; 16];
+                words[0] = format;
+                words[1] = 1;
+                words[10] = 4096;
+                let first = if unordered { 2 } else { 4 };
+                words[first] = 4;
+                words[first + 2] = 7;
+                assert_eq!(
+                    buffer_range(&View::Placed(unordered, resource, words)),
+                    Some((4108, 21))
+                );
+            }
+        }
+    }
+
     const RAW: (u32, u32, bool) = (39, 0, true);
     const fn structured(stride: u32) -> (u32, u32, bool) {
         (0, stride, false)
@@ -4099,42 +4559,6 @@ mod tests {
         assert!(heap.entry(first + 1).raw_slot.is_some());
         heap.release(first, 2);
         assert_eq!(heap.entry(first + 1), StrideEntry::NONE);
-    }
-
-    /// A slot the title rewrites while a list that read the table has not
-    /// run keeps its raw view, rewritten in place with its entry (one 64-bit
-    /// store); a raw view the slot no longer needs is not made again for
-    /// another slot until that list's hold has gone; then it is.
-    #[test]
-    fn raw_views_a_list_in_flight_may_read_are_kept_until_it_has_run() {
-        use crate::testgpu::TitleBuffer;
-        let test = "descriptor::host::tests::raw_views_a_list_in_flight_may_read_are_kept_until_it_has_run";
-        let Some(_gpu) = crate::testgpu::device(test) else {
-            return;
-        };
-        let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
-        let buffer = TitleBuffer::new(1 << 12);
-        let pool = heap.alias_base();
-        let raw_slot = |i| heap.entry(i).raw_slot.expect("a raw view");
-        heap.make_at(0, &buffer_view(false, &buffer, structured(12), (0, 8)));
-        assert_eq!(raw_slot(0), pool);
-        // A list reads the table, and has not run.
-        let in_flight = heap.stride_hold().expect("a table");
-        // Another view in the slot: its raw view rewritten in place, as the
-        // slot's descriptor is (the title rewrites its views every frame).
-        heap.make_at(0, &buffer_view(false, &buffer, structured(16), (0, 8)));
-        assert_eq!(raw_slot(0), pool, "the same pool slot");
-        assert_eq!(heap.entry(0).stride, 16);
-        // No raw view for the slot any more: its pool slot waits.
-        heap.make_null(0);
-        heap.make_at(1, &buffer_view(false, &buffer, structured(20), (0, 8)));
-        assert_eq!(raw_slot(1), pool + 1, "not reused while a list may read it");
-        // A list that started after: its hold does not keep them.
-        let later = heap.stride_hold().expect("a table");
-        drop(in_flight);
-        heap.make_at(2, &buffer_view(false, &buffer, structured(20), (1, 6)));
-        assert_eq!(raw_slot(2), pool, "given back once the list has run");
-        drop(later);
     }
 
     /// A view past its host copy's end is cut to it (the host refuses, and
@@ -4396,6 +4820,501 @@ mod tests {
         }
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Runs [`unknown_stride_program`] once over `heap` with the table at
+    /// user data `base` (the byte offset the host gives a table: slot 0 is
+    /// read at `base`, slot 1 written at `base + 32`), `src`'s copy
+    /// refreshed for it (`spans` of it, or its first 4 KiB) and `dst`'s
+    /// written back; what `dst` holds after.
+    fn run_table_program(
+        heap: &HostHeap,
+        pipeline: &(ID3D12RootSignature, ID3D12PipelineState),
+        cs: &xtp_shader::emit::HostShader,
+        (src, dst): (&crate::testgpu::TitleBuffer, &crate::testgpu::TitleBuffer),
+        base: u32,
+        spans: Option<&Picked>,
+    ) -> Vec<u32> {
+        let (root, pso) = pipeline;
+        let (table, _) = heap.stride_table().expect("a table");
+        let list = crate::testgpu::TitleList::new();
+        let l = list.host();
+        let (from, to) = (src.shadow(), dst.shadow());
+        match spans {
+            Some(picked) => {
+                for (copy, at, end) in &picked.reads {
+                    copy.refresh(l, *at, end - at);
+                }
+            }
+            None => from.refresh(l, src.address(), 1 << 12),
+        }
+        to.refresh(l, dst.address(), 1 << 12);
+        to.gpu_writes(l, dst.address(), 1 << 12);
+        l.keep(root);
+        l.keep(pso);
+        let mut values = vec![0u32; cs.user_data_dwords() as usize];
+        for u in &cs.user_data {
+            if u.root == xtp_shader::RootType::Table {
+                values[u.index as usize] = base;
+            }
+        }
+        // SAFETY: an open list with every root argument set; the heap and
+        // its table outlive the run.
+        unsafe {
+            l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.list.SetComputeRootSignature(root);
+            l.list.SetPipelineState(pso);
+            l.list
+                .SetComputeRoot32BitConstants(0, values.len() as u32, values.as_ptr().cast(), 0);
+            l.list.SetComputeRootShaderResourceView(1, table);
+            l.list.Dispatch(1, 1, 1);
+        }
+        list.run();
+        dst.words()
+    }
+
+    /// Codex review of 54ab53d, P1: the table is a root SRV, so a shader
+    /// reading the entry of whatever slot it computes read past the table,
+    /// or, for a title slot past a capped host heap, the entry of another
+    /// table in the dynamic slots there. The header bounds it: a title slot
+    /// is read only below the slots the heap mirrors, a slot the host
+    /// remapped (its user data marked, `emit::REMAPPED_SLOT`) below the
+    /// table's entries, anything else as no view (loads 0, stores dropped).
+    #[test]
+    fn stride_table_reads_stay_inside_the_table_and_tell_remapped_slots() {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
+        use crate::testgpu::TitleBuffer;
+        let test = "descriptor::host::tests::stride_table_reads_stay_inside_the_table_and_tell_remapped_slots";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
+        let len = heap.strides.as_ref().expect("a table").table.len;
+        assert_eq!(heap.table_header(), (8, len), "mirrored, entries");
+        let cs = unknown_stride_program();
+        let pipeline = table_pipeline(&host.device, &cs);
+        let (src, dst) = (TitleBuffer::new(1 << 12), TitleBuffer::new(1 << 12));
+        src.set_words(|i| 100 + i as u32);
+        // The same views in title slots 0 and 1 and in the first two
+        // dynamic slots (8 and 9), as a table made afresh holds them.
+        let views = [
+            buffer_view(false, &src, structured(16), (0, 16)),
+            buffer_view(true, &dst, structured(16), (0, 16)),
+        ];
+        let first = heap.dynamic(2).expect("dynamic slots");
+        assert_eq!(first, 8);
+        for (k, view) in views.iter().enumerate() {
+            heap.make_at(k as u32, view);
+            heap.make_at(first + k as u32, view);
+        }
+        let mut want = vec![0u32; 1 << 10];
+        // [1, 8] of 16-byte elements: dword 6; [2, 4]: dword 9; [2, 0]: 8.
+        (want[6], want[8]) = (src.words()[9], 20);
+        let mark = xtp_shader::emit::REMAPPED_SLOT << 5;
+        for (what, base, reads) in [
+            ("title slots 0 and 1", 0, true),
+            ("the remapped table in slots 8 and 9", (8 * 32) | mark, true),
+            ("title slot 8, past the mirrored ones", 8 * 32, false),
+            ("a title slot far past the table", 1 << 30, false),
+            (
+                "a remapped slot past the table",
+                ((1 << 25) * 32) | mark,
+                false,
+            ),
+        ] {
+            dst.set_words(|_| 0);
+            let out = run_table_program(&heap, &pipeline, &cs, (&src, &dst), base, None);
+            if reads {
+                assert_eq!(out[..64], want[..64], "{what}");
+            } else {
+                assert!(
+                    out.iter().all(|&w| w == 0),
+                    "{what}: nothing read or written"
+                );
+            }
+        }
+        heap.release(first, 2);
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The pipeline of a kernel that copies the 64 dwords it reads through
+    /// a one-view table (`t0`, raw) to the root UAV `u0`.
+    fn raw_copy_pipeline(host: &crate::host::Host) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(id.x * 4, src.Load(id.x * 4));
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                s!("raw copy test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .expect("the test kernel compiles");
+        let code = code.expect("compiled code");
+        // SAFETY: the blob's own bytes, which hold the root signature.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+        };
+        // SAFETY: plain object creation from live bytes.
+        unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        }
+    }
+
+    /// Records into `l` a copy of the 64 dwords pool slot `slot` of `heap`
+    /// reads into `dst`, refreshing `src`'s copy and writing `dst` back.
+    fn copy_pool_slot(
+        l: &crate::host::HostList,
+        heap: &HostHeap,
+        (root, pso): &(ID3D12RootSignature, ID3D12PipelineState),
+        slot: u32,
+        (src, dst): (&crate::testgpu::TitleBuffer, &crate::testgpu::TitleBuffer),
+    ) {
+        let (from, to) = (src.shadow(), dst.shadow());
+        from.refresh(l, src.address(), 1 << 12);
+        to.refresh(l, dst.address(), 256);
+        to.gpu_writes(l, dst.address(), 256);
+        l.keep(root);
+        l.keep(pso);
+        // SAFETY: an open list; live objects kept until it is reset; the
+        // slot is in the heap set on it.
+        unsafe {
+            l.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            l.list.SetComputeRootSignature(root);
+            l.list.SetPipelineState(pso);
+            l.list
+                .SetComputeRootDescriptorTable(0, heap.gpu_handle(slot));
+            l.list
+                .SetComputeRootUnorderedAccessView(1, to.gpu(dst.address()));
+            l.list.Dispatch(1, 1, 1);
+        }
+    }
+
+    /// Codex review of 54ab53d, P1: a slot whose view changes window while
+    /// a submission the GPU may be running read the table gets another raw
+    /// view; the one that submission may read keeps its window (rewritten
+    /// in place before, it gave such a submission the new window with the
+    /// old stride and bias). Held in flight on WARP behind a fence: a list
+    /// submitted after the change, reading the old raw view, still reads
+    /// the old window. Once the GPU has run what was in flight, the raw
+    /// view comes back to the pool, made null, with its host buffer: the
+    /// retiring ones are bounded by the submissions in flight (before,
+    /// only taking a raw view emptied them, and a slot rewritten in place
+    /// kept a buffer for good). A view whose window stays keeps its raw
+    /// view.
+    #[test]
+    fn raw_views_a_submission_in_flight_may_read_stay_until_it_has_run() {
+        use crate::testgpu::{TitleBuffer, pattern};
+        let test = "descriptor::host::tests::raw_views_a_submission_in_flight_may_read_stay_until_it_has_run";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let heap = HostHeap::with_pool(8, 4).expect("a host view heap");
+        let pipeline = raw_copy_pipeline(host);
+        let (src, dst) = (TitleBuffer::new(1 << 12), TitleBuffer::new(1 << 12));
+        src.set_words(pattern);
+        assert_eq!(src.shadow().offset(src.address()), 0, "its own copy");
+        let pool = heap.alias_base();
+        let raw_slot = |i| heap.entry(i).raw_slot.expect("a raw view");
+        // Bytes 0 to 96: 8 elements of 12.
+        heap.make_at(0, &buffer_view(false, &src, structured(12), (0, 8)));
+        assert_eq!(raw_slot(0), pool);
+        heap.make_at(0, &buffer_view(false, &src, structured(12), (0, 8)));
+        assert_eq!(raw_slot(0), pool, "the same window: the same raw view");
+        assert_eq!(heap.pool_state(), (0, 3));
+        // A submission in flight, held on the GPU.
+        let mut gate = crate::host::Gate::close(host);
+        let running = host.new_list().expect("a host list");
+        running.close();
+        host.execute(&[&running]);
+        assert!(running.running());
+        // Bytes 32 to 96 as 4 elements of 16: another raw view.
+        heap.make_at(0, &buffer_view(false, &src, structured(16), (2, 4)));
+        assert_eq!(raw_slot(0), pool + 1);
+        assert_eq!(heap.entry(0).stride, 16);
+        assert_eq!(heap.pool_state(), (1, 2), "the old one retires");
+        // Behind the one in flight: a list that reads the old raw view.
+        dst.set_words(|_| 0xdead_beef);
+        let reader = host.new_list().expect("a host list");
+        copy_pool_slot(&reader, &heap, &pipeline, pool, (&src, &dst));
+        reader.close();
+        host.execute(&[&reader]);
+        // Changes go on while they are in flight, each to another raw view.
+        heap.make_at(0, &buffer_view(false, &src, structured(20), (0, 4)));
+        assert_eq!(heap.pool_state(), (2, 1));
+        gate.open();
+        gpu_caught_up(host);
+        let old: Vec<u32> = (0..64)
+            .map(|i| if i < 24 { pattern(i) } else { 0 })
+            .collect();
+        assert_eq!(dst.words()[..64], old[..], "the old window, untouched");
+        // The GPU has run them: back, null, at the next look.
+        assert!(heap.stride_hold().is_some());
+        assert_eq!(heap.pool_state(), (0, 3));
+        let list = crate::testgpu::TitleList::new();
+        copy_pool_slot(list.host(), &heap, &pipeline, pool, (&src, &dst));
+        list.run();
+        assert!(dst.words()[..64].iter().all(|&w| w == 0), "made null");
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Waits until the GPU has run what was handed to the queue so far,
+    /// other tests' submissions too (one handed over but not yet in the
+    /// timeline is not waited for by a drain).
+    fn gpu_caught_up(host: &crate::host::Host) {
+        let ticket = host.executing();
+        let started = std::time::Instant::now();
+        while host.completed() < ticket {
+            assert!(started.elapsed().as_secs() < 30, "the GPU never got there");
+            host.drain();
+            std::thread::yield_now();
+        }
+    }
+
+    /// Codex review of 54ab53d, P2: a view the full pool gives no raw view
+    /// reads as none, but was marked made, so the next read of the same
+    /// record found nothing to do and the slot read zeros through the table
+    /// for good. Now it is made again at the next read, and gets a raw view
+    /// once one has come back.
+    #[test]
+    fn a_full_pool_gives_raw_views_again_once_one_comes_back() {
+        use crate::testgpu::TitleBuffer;
+        let test = "descriptor::host::tests::a_full_pool_gives_raw_views_again_once_one_comes_back";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let heap = HostHeap::with_pool(8, 2).expect("a host view heap");
+        let buffer = TitleBuffer::new(1 << 12);
+        // Title descriptor memory of 8 slots.
+        let slots = vec![0u64; 8 * 4];
+        let at = |i: u64| slots.as_ptr() as u64 + 32 * i;
+        for i in 0..3u32 {
+            let View::Shader(r, Some(words)) = buffer_view(false, &buffer, structured(12), (i, 4))
+            else {
+                unreachable!()
+            };
+            crate::descriptor::create_srv(
+                std::ptr::null(),
+                r as crate::object::This,
+                &words,
+                at(u64::from(i)),
+            );
+        }
+        for i in 0..3u32 {
+            assert!(heap.mirror(i, at(u64::from(i)), true).is_some());
+        }
+        assert!(heap.entry(0).raw_slot.is_some() && heap.entry(1).raw_slot.is_some());
+        assert_eq!(heap.entry(2), StrideEntry::NONE, "the pool is full");
+        assert_eq!(heap.made.lock().unwrap().keys[2], 0, "to be made again");
+        heap.mirror(2, at(2), true);
+        assert_eq!(heap.entry(2), StrideEntry::NONE, "still full");
+        // Slot 0 holds nothing any more: its raw view comes back once the
+        // GPU has run what was in flight (other tests' submissions), and
+        // slot 2's next read takes it.
+        heap.make_null(0);
+        gpu_caught_up(gpu.host());
+        heap.mirror(2, at(2), true);
+        let entry = heap.entry(2);
+        assert_eq!((entry.stride, entry.count), (12, 4));
+        assert_eq!(entry.raw_slot, Some(heap.alias_base()));
+    }
+
+    /// Codex review of 54ab53d, P1: a sweep read a slot's record from title
+    /// memory without a lock while another thread published a new one there
+    /// and made the slot; the sweep then made the slot from the record it
+    /// had read, which stayed. The record is read again under the slot's
+    /// lock: the one made is the one published.
+    #[test]
+    fn a_record_published_during_a_sweep_is_the_one_made() {
+        use crate::testgpu::TitleBuffer;
+        let test = "descriptor::host::tests::a_record_published_during_a_sweep_is_the_one_made";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
+        let buffer = TitleBuffer::new(1 << 12);
+        let slots = vec![0u64; 8 * 4];
+        let handle = slots.as_ptr() as u64 + 2 * 32;
+        let srv = |stride| {
+            let View::Shader(r, Some(words)) =
+                buffer_view(false, &buffer, structured(stride), (0, 4))
+            else {
+                unreachable!()
+            };
+            (r as crate::object::This, words)
+        };
+        let (old, new) = (srv(12), srv(20));
+        crate::descriptor::create_srv(std::ptr::null(), old.0, &old.1, handle);
+        // Between the sweep's read and its lock, the title publishes the new
+        // record and makes the slot as its view creation does.
+        let at = std::ptr::from_ref(&heap) as usize;
+        BETWEEN.with(|b| {
+            *b.borrow_mut() = Some(Box::new(move || {
+                // SAFETY: called inside `heap.mirror` below, while it lives.
+                let heap = unsafe { &*(at as *const HostHeap) };
+                crate::descriptor::create_srv(std::ptr::null(), new.0, &new.1, handle);
+                heap.mirror(2, handle, false);
+            }))
+        });
+        heap.mirror(2, handle, true);
+        assert!(BETWEEN.with(|b| b.borrow().is_none()), "the publisher ran");
+        assert_eq!(heap.entry(2).stride, 20, "the record published");
+        let [_, i, generation] = header_at(handle);
+        let key = u64::from(generation) << 32 | u64::from(i);
+        assert_eq!(heap.made.lock().unwrap().keys[2], key);
+    }
+
+    /// Codex review of 54ab53d, P1: a view of 12-byte elements from byte 20
+    /// of its copy has a raw view in the table but a null slot, and was left
+    /// out of what sweeps refresh, so a shader that picked it at run time
+    /// read a stale copy; a view cut to its copy kept its full length and,
+    /// past the title buffer, was not found at all. Both are listed, as cut
+    /// to the copy, and the program reads what the title wrote last.
+    #[test]
+    fn views_read_through_the_table_only_are_refreshed_for_picks() {
+        crate::testgpu::known_layer_errors(&[1419], "#45");
+        use crate::testgpu::TitleBuffer;
+        let test =
+            "descriptor::host::tests::views_read_through_the_table_only_are_refreshed_for_picks";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        RUN_TIME_VIEWS_TEST.set(Some(true));
+        let host = gpu.host();
+        let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
+        let cs = unknown_stride_program();
+        let pipeline = table_pipeline(&host.device, &cs);
+        let (src, dst) = (TitleBuffer::new(1 << 16), TitleBuffer::new(1 << 12));
+        let base = src.address();
+        assert_eq!(src.shadow().offset(base), 0, "its own copy");
+        // A placed buffer view (a buffer resource description, 64 KiB) of
+        // structured 12-byte elements from `at`: `count` of them.
+        let placed = |at: u64, count: u32, width: u32| {
+            let mut resource = [0u32; 14];
+            (resource[0], resource[4]) = (1, width);
+            let mut desc = [0u32; 16];
+            (desc[1], desc[2], desc[6], desc[7]) =
+                (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, count, 12);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            (resource, desc)
+        };
+        let slots = vec![0u64; 8 * 4];
+        let at = |i: u64| slots.as_ptr() as u64 + 32 * i;
+        let (r, d) = placed(base + 20, 4, (1 << 16) - 20);
+        crate::descriptor::create_placed_srv(std::ptr::null(), &r, &d, at(0));
+        // From 24 bytes before the copy's end, 100 elements: two fit.
+        let (r, d) = placed(base + (1 << 16) - 24, 100, 24);
+        crate::descriptor::create_placed_srv(std::ptr::null(), &r, &d, at(2));
+        // The program's output, in slot 1 (made by a draw's table).
+        heap.make_at(1, &buffer_view(true, &dst, structured(12), (0, 16)));
+        for i in [0, 2] {
+            heap.mirror(i, at(i.into()), false);
+        }
+        assert_eq!(heap.waiting(), 2, "both wait for a sweep");
+        let picked = heap.picked_spans(slots.as_ptr() as u64).expect("a listing");
+        assert_eq!(heap.waiting(), 0);
+        assert_eq!(heap.entry(0).stride, 12, "the table names a raw view");
+        let reads: Vec<(u64, u64)> = picked.reads.iter().map(|&(_, a, b)| (a, b)).collect();
+        assert_eq!(
+            reads,
+            [(base + 20, base + (1 << 16))],
+            "both, cut to the copy"
+        );
+        // The title writes the buffer; the list that picks refreshes what
+        // the listing says, and only that.
+        src.set_words(|i| 7000 + i as u32);
+        dst.set_words(|_| 0);
+        let out = run_table_program(&heap, &pipeline, &cs, (&src, &dst), 0, Some(&picked));
+        // [2, 4] of the view from byte 20: byte 48, dword 12, stored at
+        // [1, 8] of the output's 12-byte elements (dword 5); 20 at [2, 0].
+        assert_eq!((out[5], out[6]), (7012, 20), "what the title wrote last");
+        RUN_TIME_VIEWS_TEST.set(None);
+    }
+
+    /// Without `XTP_RUN_TIME_VIEWS=1`, nothing is kept for shaders that pick
+    /// slots at run time, as before the switch: the title's buffer views do
+    /// not wait for a sweep, and there is no listing.
+    #[test]
+    fn nothing_waits_for_sweeps_with_the_switch_off() {
+        use crate::testgpu::TitleBuffer;
+        let test = "descriptor::host::tests::nothing_waits_for_sweeps_with_the_switch_off";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        RUN_TIME_VIEWS_TEST.set(Some(false));
+        let heap = HostHeap::new_with(false, 8, true).expect("a host view heap");
+        let buffer = TitleBuffer::new(1 << 12);
+        let slots = vec![0u64; 8 * 4];
+        let View::Shader(r, Some(words)) = buffer_view(false, &buffer, structured(16), (0, 4))
+        else {
+            unreachable!()
+        };
+        let handle = slots.as_ptr() as u64;
+        crate::descriptor::create_srv(std::ptr::null(), r as crate::object::This, &words, handle);
+        heap.mirror(0, handle, false);
+        assert_eq!(heap.waiting(), 0);
+        assert!(heap.picked_spans(handle).is_none());
+        heap.mirror(0, handle, true);
+        assert!(heap.made.lock().unwrap().buffers.is_empty());
+        RUN_TIME_VIEWS_TEST.set(None);
+    }
+
+    /// Codex review of 54ab53d, P2: a title description whose range cannot
+    /// be represented (a first element of 2^62 elements of 16 bytes) is no
+    /// range, where it overflowed through an `extern "system"` call.
+    #[test]
+    fn unrepresentable_view_ranges_are_refused() {
+        assert_eq!(range_of(0x1000, 2, 4, 16), Some((0x1020, 64)));
+        assert_eq!(range_of(0x1000, 1 << 62, 4, 16), None);
+        assert_eq!(range_of(u64::MAX - 8, 1, 1, 16), None);
+        assert_eq!(range_of(u64::MAX - 64, 0, 8, 16), None);
+        let mut words = [0u32; 10];
+        // A structured view of 16 bytes from element 2^62.
+        (words[1], words[4], words[5], words[6], words[7]) = (1, 0, 1 << 30, 4, 16);
+        let placed = View::Placed(false, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], {
+            let mut d = [0u32; 16];
+            d[..10].copy_from_slice(&words);
+            d[10] = 0x1000;
+            d
+        });
+        assert_eq!(buffer_range(&placed), None);
     }
 
     /// A root SRV's one-view table (VIctory #493): a shader reading 64

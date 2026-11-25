@@ -26,16 +26,27 @@ impl Lower<'_> {
     /// a load's that nothing reads, and `flow.rs` takes them at those joins
     /// as undefined on the load's edge.
     ///
+    /// A number among a join's values shows the registers were reused, not
+    /// that the program reads the joined value only on the number's edge
+    /// (Codex review 3983f844: a read of the join on every edge stores the
+    /// descriptor's dword on the load's). Per lane, `flow.rs` proves that
+    /// edge unread (`unread_on_edge`), and a read there stops the program
+    /// as a direct read does. The console flow takes a descriptor's dword
+    /// at a join without that proof where it fails (its shortcut, counted
+    /// in `emit::UNPROVEN_DESCRIPTOR_JOINS`), so there the load keeps its
+    /// refusal: the program then takes the per-lane form where that
+    /// translates.
+    ///
     /// Not where any access takes the descriptor through a join or a choice
     /// (a descriptor chosen by control flow keeps its own path), nor where a
     /// join of the dwords takes only descriptor loads' dwords (two
     /// descriptors in one register, which a number read of the join reads
     /// as data), nor where no access uses the load itself (`flow.rs` takes
     /// only a descriptor's dwords as undefined at a join).
-    // shortcut: the descriptor-word rule's (`flow.rs`): wrong if the
-    // program read the joined register as a number on the load's edge,
-    // which register allocation does not produce.
     pub(super) fn reused_after_access(&self, site: Site, dwords: &[Option<Value>]) -> bool {
+        if self.console_cf {
+            return false;
+        }
         let ours: HashSet<Value> = dwords.iter().flatten().copied().collect();
         let mut direct = HashSet::new();
         // Every scalar load a descriptor comes from (`descriptor_dword`'s).

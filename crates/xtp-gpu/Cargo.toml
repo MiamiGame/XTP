@@ -23,6 +23,8 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# Publication synthétique pour les tests des imports HLE, sans périphérique D3D.
+readmap-test = []
 
 [lints]
 workspace = true

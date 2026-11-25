@@ -134,14 +134,14 @@ impl<'a> Lower<'a> {
                 if self.mask_data != MaskData::Console || self.split && !self.console_cf {
                     return Err("a count without the console wave's lanes");
                 }
-                let &mask = self
+                let &m = self
                     .x
                     .st
                     .masks
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let c = self.cur;
-                let on = self.boolean(mask, c)?;
+                let on = self.active_mask(mask, m, c)?;
                 self.s.flags |= flags::WAVE_OPS;
                 let bit = self.s.m.cast(c, Cast::ZExt, on, self.s.t.i32);
                 let sum = self.s.m.i8(0);
@@ -181,7 +181,7 @@ impl<'a> Lower<'a> {
                     .masks
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
-                let on = self.boolean(m, c)?;
+                let on = self.active_mask(mask, m, c)?;
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 return Ok(self.s.m.select(c, on, x, id));
@@ -203,7 +203,7 @@ impl<'a> Lower<'a> {
             .masks
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
-        let on = self.boolean(m, c)?;
+        let on = self.active_mask(mask, m, c)?;
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -608,6 +608,7 @@ impl<'a> Lower<'a> {
     pub(super) fn any_lane(&mut self, m: Bool) -> Result<V, Why> {
         let c = self.cur;
         let bit = self.boolean(m, c)?;
+        let bit = self.with_partial(c, bit);
         let (lo, hi) = self.console_ballot(c, bit);
         let or = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
@@ -646,6 +647,16 @@ impl<'a> Lower<'a> {
     pub(super) fn console_flat(&mut self) -> V {
         if let Some(f) = self.console_flat {
             return f;
+        }
+        let shape = self.s.threads.expect("compute");
+        if shape[1..] != [1, 1] {
+            // Sur NVIDIA, deux waves d'une tuile 2D peuvent avoir le même
+            // premier indice arrondi (0xkn0wh3r3, VIctory #2126). Déclarer
+            // le groupe sur une ligne donne à chaque wave sa plage alignée.
+            // Les coordonnées console se déduisent de la forme d'origine,
+            // comme pour les dérivées implicites et les lanes appariées.
+            self.flat_group = Some(shape);
+            self.s.threads = Some([shape.iter().product(), 1, 1]);
         }
         let e = self.s.entry;
         let i32t = self.s.t.i32;

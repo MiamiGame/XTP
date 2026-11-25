@@ -46,6 +46,7 @@ windows = { workspace = true, features = [
 windows-core = { workspace = true, optional = true }
 
 [dev-dependencies]
+xtp-gpu = { workspace = true, features = ["readmap-test"] }
 xtp-core.workspace = true
 tempfile.workspace = true
 xtp-testkit.workspace = true

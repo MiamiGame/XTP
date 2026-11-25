@@ -351,6 +351,8 @@ fn run(
                 [bits as u32, (bits >> 32) as u32]
             })
             .collect();
+        // The table's header first (`emit::STRIDE_HEADER`): both slots mirrored.
+        let table = [vec![0, 2, 0, 2], table].concat();
         roots.push((
             roots.len() as u32,
             Root::View {

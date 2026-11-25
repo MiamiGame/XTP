@@ -2,9 +2,12 @@
 //! title's own compute passes write most of them; a pass we drop or
 //! translate wrongly leaves whatever the memory held, and a draw of four
 //! billion vertices or a dispatch past the host's limits runs until the
-//! host resets the display driver. So every record is clamped on the GPU,
-//! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! host resets the display driver.
+//!
+//! Une passe de calcul borne une série d’exécutions à partir de sa table
+//! d’upload. Chaque commande et son compteur occupent une tranche privée.
+//! Les dispatches ordinaires y gardent le format natif XYZ, les morceaux
+//! qui utilisent une origine de groupe ont une signature distincte.
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -30,13 +33,13 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2), UAV(u3), UAV(u4)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint flags; };
+#define RS "SRV(t0), UAV(u0), UAV(u1), UAV(u2), UAV(u3), UAV(u4)"
+ByteAddressBuffer run : register(t0);
 RWByteAddressBuffer args : register(u0);
 RWByteAddressBuffer budget : register(u1);
 RWByteAddressBuffer pieces : register(u2);
@@ -44,6 +47,7 @@ RWByteAddressBuffer countBuffer : register(u3);
 RWByteAddressBuffer stats : register(u4);
 static const uint BUDGET = 1u << 27;
 static const uint LIMIT = 65535;
+static const uint MAX_GROUPS = BUDGET / 64;
 groupshared uint costs[64];
 groupshared uint sizes[64];
 groupshared uint starts[64];
@@ -52,96 +56,130 @@ groupshared uint metrics[16];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
-    uint active = records;
-    if (flags & 1) active = min(active, countBuffer.Load(0));
-    bool measure = (flags & 2) != 0;
-    if (measure && lane < 16) metrics[lane] = 0;
-    GroupMemoryBarrierWithGroupSync();
-    uint left = 0, written = 0;
+    uint left = 0;
     if (lane == 0) left = BUDGET - min(budget.Load(0), BUDGET);
-    for (uint tile = 0; tile < records; tile += 64) {
-        uint n = min(records - tile, 64u);
-        uint at = (tile + lane) * stride;
-        uint cost = 0, size = 0;
-        uint3 g = 0;
-        if (tile + lane < active) {
-            if (kind <= 1) {
-                uint2 raw = args.Load2(at);
-                uint vertices = min(raw.x, 1u << 24);
-                uint instances = min(raw.y, (1u << 26) / max(vertices, 1u));
-                if (measure) {
-                    InterlockedMax(metrics[8], raw.x);
-                    InterlockedMax(metrics[9], raw.y);
-                    if (vertices != raw.x) InterlockedAdd(metrics[10], 1);
-                    if (instances != raw.y) InterlockedAdd(metrics[11], 1);
-                    if (any(raw != uint2(vertices, instances))) InterlockedAdd(metrics[4], 1);
-                }
-                args.Store2(at, uint2(vertices, instances));
-                cost = vertices * instances;
-            } else {
-                g = args.Load3(at);
-                if (measure) {
-                    InterlockedMax(metrics[0], g.x);
-                    InterlockedMax(metrics[1], g.y);
-                    InterlockedMax(metrics[2], g.z);
-                    if (any(g > LIMIT)) InterlockedAdd(metrics[3], 1);
-                }
-                if (kind == 10 && measure && any(g == 0)) InterlockedAdd(metrics[14], 1);
-                if (all(g != 0)) {
-                    uint weight = kind == 2 ? 64 : 128;
-                    if (measure && g.x > (1u << 20) / g.y / g.z) InterlockedAdd(metrics[12], 1);
-                    // Division avant multiplication, même pour trois UINT_MAX.
-                    if (g.x > BUDGET / weight / g.y / g.z) {
-                        if (measure) InterlockedAdd(metrics[5], 1);
-                    } else {
-                        cost = g.x * g.y * g.z * weight;
-                        uint3 tiles = (g - 1) / LIMIT + 1;
-                        size = tiles.x * tiles.y * tiles.z;
+    uint executions = run.Load(0);
+    for (uint e = 0; e < executions; ++e) {
+        uint4 spec = run.Load4(16 + e * 32);
+        uint kind = spec.x, stride = spec.y, records = spec.z, flags = spec.w;
+        uint4 offsets = run.Load4(32 + e * 32);
+        uint active = records;
+        if (flags & 1) active = min(active, countBuffer.Load(offsets.y));
+        bool measure = (flags & 2) != 0;
+        if (measure && lane < 16) metrics[lane] = 0;
+        GroupMemoryBarrierWithGroupSync();
+        bool compact = (flags & 4) != 0;
+        bool prefix = (flags & 8) != 0;
+        uint nativeAt = offsets.z + 16 + 24 * min(records + MAX_GROUPS / LIMIT, MAX_GROUPS);
+        uint nativeCount = 0, written = 0;
+        for (uint tile = 0; tile < records; tile += 64) {
+            uint n = min(records - tile, 64u);
+            uint at = offsets.x + (tile + lane) * stride;
+            uint cost = 0, size = 0;
+            uint3 g = 0;
+            uint2 draw = 0;
+            if (tile + lane < active) {
+                if (kind <= 1) {
+                    uint2 raw = args.Load2(at);
+                    uint vertices = min(raw.x, 1u << 24);
+                    uint instances = min(raw.y, (1u << 26) / max(vertices, 1u));
+                    if (measure) {
+                        InterlockedMax(metrics[8], raw.x);
+                        InterlockedMax(metrics[9], raw.y);
+                        if (vertices != raw.x) InterlockedAdd(metrics[10], 1);
+                        if (instances != raw.y) InterlockedAdd(metrics[11], 1);
+                        if (any(raw != uint2(vertices, instances))) InterlockedAdd(metrics[4], 1);
+                    }
+                    draw = all(raw == uint2(vertices, instances)) ? raw : uint2(0, 0);
+                    cost = draw.x * draw.y;
+                } else {
+                    g = args.Load3(at);
+                    if (measure) {
+                        InterlockedMax(metrics[0], g.x);
+                        InterlockedMax(metrics[1], g.y);
+                        InterlockedMax(metrics[2], g.z);
+                        if (any(g > LIMIT)) InterlockedAdd(metrics[3], 1);
+                    }
+                    if (kind == 10 && measure && any(g == 0)) InterlockedAdd(metrics[14], 1);
+                    if (all(g != 0)) {
+                        uint weight = kind == 2 ? 64 : 128;
+                        if (measure && g.x > (1u << 20) / g.y / g.z) InterlockedAdd(metrics[12], 1);
+                        // Division avant multiplication, même pour trois UINT_MAX.
+                        if (g.x > BUDGET / weight / g.y / g.z) {
+                            if (measure) InterlockedAdd(metrics[5], 1);
+                        } else {
+                            uint groups = g.x * g.y * g.z;
+                            cost = groups * weight;
+                            // MeshGroup ne lit que X. Une origine X par morceau
+                            // conserve tous les identifiants de la grille linéarisée.
+                            if (kind == 10) g = uint3(groups, 1, 1);
+                            uint3 tiles = (g - 1) / LIMIT + 1;
+                            size = tiles.x * tiles.y * tiles.z;
+                        }
                     }
                 }
             }
-        }
-        costs[lane] = cost;
-        sizes[lane] = size;
-        GroupMemoryBarrierWithGroupSync();
-        if (lane == 0) {
-            for (uint i = 0; i < n; i++) {
-                starts[i] = written;
-                if (costs[i] > left) {
-                    left = 0;
-                    costs[i] = 0xffffffff;
-                    if (measure) InterlockedAdd(metrics[6], 1);
-                } else {
-                    left -= costs[i];
-                    written += sizes[i];
+            costs[lane] = cost;
+            sizes[lane] = size;
+            GroupMemoryBarrierWithGroupSync();
+            if (lane == 0) {
+                for (uint i = 0; i < n; i++) {
+                    starts[i] = written;
+                    if (costs[i] > left) {
+                        left = 0;
+                        costs[i] = 0xffffffff;
+                        if (measure) InterlockedAdd(metrics[6], 1);
+                    } else {
+                        left -= costs[i];
+                        if (measure && sizes[i] > 1) InterlockedAdd(metrics[15], 1);
+                        // Préfixe au format D3D12 natif jusqu’au premier
+                        // découpage. Le suffixe garde ensuite l’ordre du titre.
+                        if (prefix && written == 0 && sizes[i] == 1)
+                            starts[i] = 0x80000000 | nativeCount++;
+                        else
+                            written += sizes[i];
+                    }
                 }
             }
+            GroupMemoryBarrierWithGroupSync();
+            if (kind <= 1 && tile + lane < active) {
+                uint dst = offsets.z + 4 + (tile + lane) * 24;
+                if (costs[lane] == 0xffffffff) draw = 0;
+                pieces.Store4(dst, uint4(draw, args.Load2(at + 8)));
+                if (kind == 1) pieces.Store(dst + 16, args.Load(at + 16));
+            } else if (size != 0 && costs[lane] != 0xffffffff && (starts[lane] & 0x80000000)) {
+                pieces.Store3(nativeAt + 4 + 12 * (starts[lane] & 0x7fffffff), g);
+            } else if (size != 0 && costs[lane] != 0xffffffff) {
+                // Deux axes > LIMIT dépasseraient déjà le budget de toute la liste.
+                uint3 step = uint3(g.x > LIMIT, g.y > LIMIT, g.z > LIMIT) * LIMIT;
+                for (uint j = 0; j < size; j++) {
+                    uint3 base = step * j;
+                    uint index = starts[lane] + j;
+                    uint3 dims = min(g - base, LIMIT);
+                    if (compact) {
+                        pieces.Store3(offsets.z + 4 + 12 * index, dims);
+                    } else {
+                        uint dst = offsets.z + 4 + 24 * index;
+                        pieces.Store3(dst, base);
+                        pieces.Store3(dst + 12, dims);
+                    }
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
         }
-        GroupMemoryBarrierWithGroupSync();
-        if (costs[lane] == 0xffffffff) {
-            if (kind <= 1) args.Store(at, 0);
-        } else if (size != 0) {
-            // Deux axes > LIMIT dépasseraient déjà le budget de toute la liste.
-            uint3 step = uint3(g.x > LIMIT, g.y > LIMIT, g.z > LIMIT) * LIMIT;
-            for (uint j = 0; j < size; j++) {
-                uint3 base = step * j;
-                uint dst = 4 + 24 * (starts[lane] + j);
-                pieces.Store3(dst, base);
-                pieces.Store3(dst + 12, min(g - base, LIMIT));
+        if (lane == 0) {
+            pieces.Store(offsets.z, kind > 1 ? written : active);
+            if (prefix) pieces.Store(nativeAt, nativeCount);
+            if (measure) {
+                stats.Store4(offsets.w + 0, uint4(metrics[0], metrics[1], metrics[2], metrics[3]));
+                stats.Store4(offsets.w + 16, uint4(metrics[4], metrics[5], metrics[6], active));
+                stats.Store4(offsets.w + 32, uint4(metrics[8], metrics[9], metrics[10], metrics[11]));
+                stats.Store4(offsets.w + 48, uint4(metrics[12], BUDGET - left, metrics[14], metrics[15]));
             }
         }
         GroupMemoryBarrierWithGroupSync();
     }
-    if (lane == 0) {
-        budget.Store(0, BUDGET - left);
-        if (kind > 1) pieces.Store(0, written);
-        if (measure) {
-            stats.Store4(0, uint4(metrics[0], metrics[1], metrics[2], metrics[3]));
-            stats.Store4(16, uint4(metrics[4], metrics[5], metrics[6], active));
-            stats.Store4(32, uint4(metrics[8], metrics[9], metrics[10], metrics[11]));
-            stats.Store3(48, uint3(metrics[12], BUDGET - left, metrics[14]));
-        }
-    }
+    if (lane == 0) budget.Store(0, BUDGET - left);
 }
 "#;
 
@@ -191,6 +229,7 @@ struct Counts {
     over_million_groups: u64,
     max_list_cost: u32,
     empty_mesh: u64,
+    split_records: u64,
 }
 
 #[cfg(feature = "diagnostics")]
@@ -231,6 +270,7 @@ impl Sample {
         c.over_million_groups += u64::from(read(12));
         c.max_list_cost = c.max_list_cost.max(read(13));
         c.empty_mesh += u64::from(read(14));
+        c.split_records += u64::from(read(15));
     }
 }
 
@@ -250,7 +290,7 @@ pub(crate) struct Samples {
 }
 
 impl Samples {
-    pub(crate) fn next(&mut self, list: &HostList, pipeline: usize) -> Option<u64> {
+    pub(crate) fn next(&mut self, list: &HostList, pipeline: usize) -> Option<(u64, u32)> {
         #[cfg(feature = "diagnostics")]
         {
             if measuring() {
@@ -267,7 +307,7 @@ impl Samples {
                     hash,
                 });
                 // SAFETY: l’enregistrement soumis conserve la page et chaque plage est distincte.
-                let gpu = unsafe { buffer.GetGPUVirtualAddress() } + *offset as u64;
+                let gpu = (unsafe { buffer.GetGPUVirtualAddress() }, *offset as u32);
                 *offset += 64;
                 return Some(gpu);
             }
@@ -357,93 +397,343 @@ const RECORD_BYTES: u32 = 24;
 const MAX_GROUPS: u32 = (1 << 27) / 64;
 const EXTRA: u32 = MAX_GROUPS / LIMIT;
 
-/// Mémoire réutilisée par les dispatches d’une même liste.
-pub(crate) struct Expanded {
-    pub(crate) buffer: ID3D12Resource,
-    pub(crate) capacity: u32,
+const RUN_LENGTH: usize = 128;
+const PAGE_BYTES: u32 = 64 << 10;
+
+/// Une écriture dans l’un des deux tampons ferme la série. Seules les écritures
+/// UAV demandent aussi une barrière, les copies ont leurs transitions D3D12.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Writes {
+    series: u64,
+    revisions: [u64; 2],
 }
 
-impl Expanded {
-    pub(crate) fn reserve<'a>(
-        held: &'a mut Option<Self>,
-        list: &HostList,
-        records: u32,
-    ) -> Option<&'a Self> {
-        // Une commande produite contient au moins un groupe accepté.
-        let needed = records.saturating_add(EXTRA).min(MAX_GROUPS);
-        if held.as_ref().is_none_or(|s| s.capacity < needed) {
-            // 4 octets pour le compteur et 12 de marge pour la signature sans base.
-            let bytes = needed.checked_mul(RECORD_BYTES)?.checked_add(16)?;
-            let (buffer, _) = host()?.shared_buffer(u64::from(bytes))?;
-            list.keep(&buffer);
-            *held = Some(Self {
-                buffer,
-                capacity: needed,
-            });
+#[derive(Default)]
+pub(crate) struct Writers {
+    revisions: std::collections::HashMap<usize, u64>,
+    unknown: u64,
+    series: u64,
+    watched: [usize; 2],
+}
+
+impl Writers {
+    pub(crate) fn record(&mut self, buffer: &ID3D12Resource, uav: bool) {
+        let id = buffer.as_raw() as usize;
+        if uav {
+            *self.revisions.entry(id).or_default() += 1;
         }
-        held.as_ref()
+        if self.watched.contains(&id) {
+            self.series += 1;
+        }
+    }
+
+    pub(crate) fn unknown(&mut self) {
+        self.unknown += 1;
+        self.series += 1;
+    }
+
+    pub(crate) fn before(
+        &mut self,
+        args: &ID3D12Resource,
+        count: Option<&ID3D12Resource>,
+    ) -> Writes {
+        let watched = [
+            args.as_raw() as usize,
+            count.map_or(0, |b| b.as_raw() as usize),
+        ];
+        if self.watched != watched {
+            self.watched = watched;
+            self.series += 1;
+        }
+        Writes {
+            series: self.series,
+            revisions: watched
+                .map(|id| self.unknown + self.revisions.get(&id).copied().unwrap_or(0)),
+        }
     }
 }
 
-/// Balaye les seules commandes actives, en conservant le budget de la liste.
-/// Les dessins sont bridés en place, les dispatches écrits dans « expanded ».
-pub(crate) fn rewrite(
-    list: &HostList,
-    gpu: u64,
-    (kind, stride, records): (u32, u32, u32),
-    count: Option<u64>,
-    expanded: Option<&Expanded>,
-    stats: Option<u64>,
-) -> bool {
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
-        return false;
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Inputs {
+    args: u64,
+    count: u64,
+    stats: u64,
+    series: u64,
+}
+
+struct Run {
+    inputs: Inputs,
+    table: usize,
+    len: usize,
+}
+
+impl Run {
+    fn append(&mut self, row: [u32; 8]) {
+        // SAFETY: zone d’upload privée de la liste, remplie pendant l’enregistrement.
+        // Une remise à zéro conserve la table de toute soumission en vol.
+        unsafe {
+            let table = self.table as *mut u32;
+            table
+                .add(4 + 8 * self.len)
+                .copy_from_nonoverlapping(row.as_ptr(), 8);
+            self.len += 1;
+            table.write(self.len as u32);
+        }
+    }
+}
+
+struct Page {
+    buffer: ID3D12Resource,
+    used: u32,
+    bytes: u32,
+    indirect: bool,
+}
+
+impl Page {
+    fn state(&mut self, list: &HostList, indirect: bool) {
+        if self.indirect == indirect {
+            return;
+        }
+        let states = [
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        ];
+        // SAFETY: la liste conserve la page jusqu’à la fin de sa soumission.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &self.buffer,
+                states[self.indirect as usize],
+                states[indirect as usize],
+            )])
+        };
+        self.indirect = indirect;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Runs {
+    open: Option<Run>,
+    page: Option<Page>,
+    ordered: std::collections::HashMap<usize, u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Output {
+    /// Sortie lue via UAV ou copiée pour un prédicat GPU.
+    Uav,
+    Draw,
+    Expanded,
+    Native,
+    NativePrefix,
+}
+
+impl Output {
+    pub(crate) fn dispatch(has_base: bool) -> Self {
+        if expansion_control() {
+            Self::Expanded
+        } else if has_base {
+            Self::NativePrefix
+        } else {
+            Self::Native
+        }
+    }
+}
+
+// Témoin de mesure : mêmes séries et même budget, tous les dispatches au
+// format de cxhair (base + dimensions), dans sa mémoire système mappée.
+fn expansion_control() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("XTP_INDIRECT_EXPANSION_CONTROL").is_ok_and(|s| s == "1"))
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        false
+    }
+}
+
+pub(crate) struct Bounded {
+    pub(crate) buffer: ID3D12Resource,
+    pub(crate) offset: u64,
+    pub(crate) capacity: u32,
+    pub(crate) dispatched: bool,
+    pub(crate) native_offset: Option<u64>,
+}
+
+/// Une ressource peut dépasser la fenêtre de 4 Gio d’une vue HLSL brute.
+fn window(buffer: &ID3D12Resource, offset: u64, bytes: u32) -> Option<(u64, u32)> {
+    // SAFETY: la ressource est vivante et ses dimensions sont immuables.
+    let (gpu, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+    if !offset.is_multiple_of(4) || offset.checked_add(u64::from(bytes))? > width {
+        return None;
+    }
+    let base = if offset + u64::from(bytes) > u64::from(u32::MAX) {
+        offset
+    } else {
+        0
     };
+    Some((gpu + base, (offset - base) as u32))
+}
+
+/// Une seule passe prépare les commandes d’une série. Les arguments et le compteur
+/// sont lus ensemble, et chaque exécution reçoit une tranche de sortie distincte.
+/// Une écriture intermédiaire sur l’une des deux entrées ouvre une nouvelle série.
+pub(crate) fn bound(
+    list: &HostList,
+    (buffer, offset): (&ID3D12Resource, u64),
+    (kind, stride, records): (u32, u32, u32),
+    count: Option<(&ID3D12Resource, u64)>,
+    stats: Option<(u64, u32)>,
+    writes: Writes,
+    output: Output,
+) -> Option<Bounded> {
     let min_stride = match kind {
         0 => 16,
         1 => 20,
-        2 | 10 if expanded.is_some() => 12,
-        _ => return false,
+        2 | 10 => 12,
+        _ => return None,
     };
-    if stride < min_stride
-        || !gpu.is_multiple_of(4)
-        || !stride.is_multiple_of(4)
-        || stride.checked_mul(records).is_none()
-        || count.is_some_and(|v| !v.is_multiple_of(4))
-    {
-        return false;
+    if stride < min_stride || !stride.is_multiple_of(4) || records == 0 {
+        return None;
     }
-    let flags = u32::from(count.is_some()) | (u32::from(stats.is_some()) << 1);
-    let constants = [kind, stride, records, flags];
-    let l = &list.list;
-    // SAFETY: chaque vue utilisée désigne un tampon gardé par la liste.
-    unsafe {
-        l.ResourceBarrier(&[uav_barrier()]);
-        l.SetComputeRootSignature(&c.root);
-        l.SetPipelineState(&c.pso);
-        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-        l.SetComputeRootUnorderedAccessView(1, gpu);
-        l.SetComputeRootUnorderedAccessView(2, budget);
-        l.SetComputeRootUnorderedAccessView(
-            3,
-            expanded.map_or(budget, |s| s.buffer.GetGPUVirtualAddress()),
-        );
-        l.SetComputeRootUnorderedAccessView(4, count.unwrap_or(budget));
-        l.SetComputeRootUnorderedAccessView(5, stats.unwrap_or(budget));
-        l.Dispatch(1, 1, 1);
-        l.ResourceBarrier(&[uav_barrier()]);
+    let (args_base, args_at) = window(buffer, offset, stride.checked_mul(records)?)?;
+    let (count_base, count_at) = match count {
+        Some((b, at)) => window(b, at, 4)?,
+        None => (args_base, 0),
+    };
+    let (stats_base, stats_at) = stats.unwrap_or((0, 0));
+    let inputs = Inputs {
+        args: args_base,
+        count: count_base,
+        stats: stats_base,
+        series: writes.series,
+    };
+    let capacity = if kind <= 1 {
+        records
+    } else {
+        records.saturating_add(EXTRA).min(MAX_GROUPS)
+    };
+    // Douze octets en fin de tranche pour la signature qui saute la base XYZ.
+    let stride_out = if output == Output::Native {
+        12
+    } else {
+        RECORD_BYTES
+    };
+    let base_bytes = capacity.checked_mul(stride_out)?.checked_add(16)?;
+    let native_bytes = if output == Output::NativePrefix {
+        records.min(MAX_GROUPS).checked_mul(12)?.checked_add(4)?
+    } else {
+        0
+    };
+    let bytes = base_bytes.checked_add(native_bytes)?;
+    let mut runs = list.clamps.lock().unwrap_or_else(|e| e.into_inner());
+    let join = runs
+        .open
+        .as_ref()
+        .is_some_and(|r| r.inputs == inputs && r.len < RUN_LENGTH)
+        && runs
+            .page
+            .as_ref()
+            .is_some_and(|p| bytes <= p.bytes - p.used);
+    let at = if join { runs.page.as_ref()?.used } else { 0 };
+    let flags = u32::from(count.is_some())
+        | (u32::from(stats.is_some()) << 1)
+        | (u32::from(output == Output::Native) << 2)
+        | (u32::from(output == Output::NativePrefix) << 3);
+    let row = [
+        kind, stride, records, flags, args_at, count_at, at, stats_at,
+    ];
+    let _timed;
+    let dispatched = match &mut runs.open {
+        Some(run) if join => {
+            run.append(row);
+            false
+        }
+        _ => {
+            let c = clamp()?;
+            let budget = list.budget()?;
+            let (table, data) = list.scratch(16 + RUN_LENGTH as u64 * 32)?;
+            let mut run = Run {
+                inputs,
+                table: data as usize,
+                len: 0,
+            };
+            run.append(row);
+            let new_page = runs.page.as_ref().is_none_or(|p| bytes > p.bytes);
+            if new_page {
+                let bytes = bytes.max(PAGE_BYTES);
+                let buffer = if expansion_control() {
+                    host()?.shared_buffer(bytes.into())?.0
+                } else {
+                    crate::host::buffers::card_buffer(&host()?.device, bytes.into())?
+                };
+                list.keep(&buffer);
+                runs.page = Some(Page {
+                    buffer,
+                    used: 0,
+                    bytes,
+                    indirect: false,
+                });
+            }
+            _timed = crate::timestamps::command(list, crate::timestamps::What::Clamp, None);
+            let mut barriers = Vec::new();
+            // La première lecture ordonne aussi les écritures des listes précédentes.
+            for (b, revision) in [
+                (Some(buffer), writes.revisions[0]),
+                (count.map(|(b, _)| b), writes.revisions[1]),
+            ] {
+                if let Some(b) = b
+                    && runs.ordered.insert(b.as_raw() as usize, revision) != Some(revision)
+                {
+                    barriers.push(uav_barrier(b));
+                }
+            }
+            if runs.open.is_some() {
+                barriers.push(uav_barrier(&budget));
+            }
+            let page = runs.page.as_mut()?;
+            if !new_page && !page.indirect {
+                // La dernière expansion de rectangles a lu cette page en UAV.
+                barriers.push(uav_barrier(&page.buffer));
+            }
+            page.state(list, false);
+            let l = &list.list;
+            // SAFETY: les entrées, la table et la sortie sont gardées par l’enregistrement.
+            unsafe {
+                if !barriers.is_empty() {
+                    l.ResourceBarrier(&barriers);
+                }
+                let budget = budget.GetGPUVirtualAddress();
+                l.SetComputeRootSignature(&c.root);
+                l.SetPipelineState(&c.pso);
+                l.SetComputeRootShaderResourceView(0, table);
+                l.SetComputeRootUnorderedAccessView(1, args_base);
+                l.SetComputeRootUnorderedAccessView(2, budget);
+                l.SetComputeRootUnorderedAccessView(3, page.buffer.GetGPUVirtualAddress());
+                l.SetComputeRootUnorderedAccessView(4, count_base);
+                l.SetComputeRootUnorderedAccessView(5, stats.map_or(budget, |s| s.0));
+                l.Dispatch(1, 1, 1);
+            }
+            runs.open = Some(run);
+            true
+        }
+    };
+    let page = runs.page.as_mut()?;
+    page.used = at + bytes;
+    page.state(list, output != Output::Uav);
+    if output == Output::Uav && dispatched {
+        // SAFETY: la passe des rectangles lit la sortie via une UAV.
+        unsafe { list.list.ResourceBarrier(&[uav_barrier(&page.buffer)]) };
     }
-    true
-}
-
-pub(crate) fn ready(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: la liste est ouverte et le tampon a été préparé en UAV.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-        )])
-    }
+    Some(Bounded {
+        buffer: page.buffer.clone(),
+        offset: at.into(),
+        capacity,
+        dispatched,
+        native_offset: (output == Output::NativePrefix)
+            .then(|| u64::from(at) + u64::from(base_bytes)),
+    })
 }
 
 /// La signature des morceaux installe trois constantes avant la commande.
@@ -481,6 +771,19 @@ pub(crate) fn signature(
     signature
 }
 
+/// Limite le travail avant de parcourir les morceaux sur le CPU. La multiplication
+/// protégée conserve les trois axes du calcul et linéarise ceux du mesh sur X.
+fn direct_groups(groups: [u32; 3], mesh: bool) -> Option<[u32; 3]> {
+    if groups.contains(&0) {
+        return Some([0, 1, 1]);
+    }
+    let [x, y, z] = groups;
+    if x > MAX_GROUPS / y / z {
+        return None;
+    }
+    Some(if mesh { [x * y * z, 1, 1] } else { groups })
+}
+
 pub(crate) fn direct(
     list: &HostList,
     groups: [u32; 3],
@@ -488,16 +791,13 @@ pub(crate) fn direct(
     mesh: bool,
     mut run: impl FnMut([u32; 3]),
 ) {
-    let mut extent = groups.map(|n| n.min(LIMIT));
+    let Some(groups) = direct_groups(groups, mesh) else {
+        return;
+    };
+    let extent = groups.map(|n| n.min(LIMIT));
     if groups.contains(&0) {
         run(extent);
         return;
-    }
-    if mesh {
-        // DispatchMesh limite également le produit XYZ d’une commande.
-        const MAX_MESH_GROUPS: u32 = (1 << 22) - 1;
-        extent[1] = extent[1].min(MAX_MESH_GROUPS / extent[0]);
-        extent[2] = extent[2].min(MAX_MESH_GROUPS / extent[0] / extent[1]);
     }
     if groups == extent {
         run(groups);
@@ -535,26 +835,14 @@ pub(crate) fn direct(
     }
 }
 
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
-    };
-}
-
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+fn uav_barrier(buffer: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
+                // SAFETY: la barrière emprunte la ressource pour ResourceBarrier.
+                pResource: unsafe { std::mem::transmute_copy(buffer) },
             }),
         },
     }
@@ -562,14 +850,32 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
-    use crate::testgpu::device;
+    use super::*;
+    use crate::testgpu::{TitleBuffer, TitleList};
+
+    fn read_commands(list: &HostList, commands: &Bounded, bytes: u64) -> (ID3D12Resource, *mut u8) {
+        let (result, data) = host().unwrap().shared_buffer(bytes).unwrap();
+        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        let indirect = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+        // SAFETY: les deux plages vivent jusqu’au retour de drain().
+        unsafe {
+            list.list
+                .ResourceBarrier(&[transition(&commands.buffer, indirect, source)]);
+            list.list
+                .CopyBufferRegion(&result, 0, &commands.buffer, commands.offset, bytes);
+            list.list
+                .ResourceBarrier(&[transition(&commands.buffer, source, indirect)]);
+        }
+        (result, data)
+    }
 
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
-        if super::host().is_none() {
-            return; // no host GPU here
-        }
+        let test = "indirect::tests::argument_clamp_builds";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
         assert!(super::clamp().is_some());
     }
 
@@ -578,7 +884,7 @@ mod tests {
     /// it ran empty). One more record follows them and must stay as
     /// written. `None` without a host GPU (`test`'s skip is reported).
     fn clamped(test: &str, kind: u32, words: &[u32], records: u32, calls: u32) -> Option<Vec<u32>> {
-        let gpu = device(test)?;
+        let gpu = crate::testgpu::device(test)?;
         let host = gpu.host();
         // Words in a record of `kind`.
         let per: usize = match kind {
@@ -597,11 +903,21 @@ mod tests {
             for at in 0..all {
                 data.add(at).write_volatile(words[at % words.len()]);
             }
-            let gpu = buffer.GetGPUVirtualAddress();
-            for _ in 0..calls {
-                assert!(super::rewrite(&list, gpu, spec, None, None, None));
-            }
         }
+        let mut commands = None;
+        for _ in 0..calls {
+            commands = super::bound(
+                &list,
+                (&buffer, 0),
+                spec,
+                None,
+                None,
+                Writes::default(),
+                Output::Draw,
+            );
+            assert!(commands.is_some());
+        }
+        let (_out, result) = read_commands(&list, &commands.unwrap(), 4 + u64::from(records) * 24);
         list.close();
         host.execute(&[&list]);
         host.drain();
@@ -616,18 +932,17 @@ mod tests {
             }
             Some(
                 (0..records as usize)
-                    .map(|i| data.add(i * per).read_volatile())
+                    .map(|i| result.cast::<u32>().add(1 + i * 6).read_volatile())
                     .collect(),
             )
         }
     }
 
-    /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
-    /// vertex instances each once clamped) two run, where a wrapping add let four.
+    /// Sur 128 dessins coûtant chacun 2^26 instances de sommet, seuls deux passent.
     #[test]
     fn rejected_records_do_not_wrap_the_budget() {
         let test = "indirect::tests::rejected_records_do_not_wrap_the_budget";
-        let Some(draws) = clamped(test, 0, &[u32::MAX], 128, 1) else {
+        let Some(draws) = clamped(test, 0, &[1 << 24, 4, 0, 0], 128, 1) else {
             return;
         };
         assert_eq!(draws.iter().filter(|&&count| count != 0).count(), 2);
@@ -644,32 +959,29 @@ mod tests {
         let host = gpu.host();
         let list = host.new_list().unwrap();
         let (args, data) = host.shared_buffer(16 * 18).unwrap();
-        let (out, written) = host.shared_buffer(16 + 24 * 64).unwrap();
         let (stats, counts) = host.shared_buffer(64).unwrap();
-        let scratch = super::Expanded {
-            buffer: out,
-            capacity: 64,
-        };
         // SAFETY: les tampons mappés appartiennent au test jusqu’à drain().
         unsafe {
             let words = std::slice::from_raw_parts_mut(data.cast::<u32>(), 18 * 4);
             for record in words.as_chunks_mut::<4>().0 {
-                record.copy_from_slice(&[70_000, 1, 1, 0]);
+                record.copy_from_slice(&[7000, 2, 5, 0]);
             }
             words[..3].fill(u32::MAX);
             words[3] = 17;
             // An active empty record and one beyond the count. Only the first is measured.
             words[4 * 16 + 1] = 0;
             words[4 * 17 + 1] = 0;
-            let gpu = args.GetGPUVirtualAddress();
-            assert!(super::rewrite(
+            let commands = super::bound(
                 &list,
-                gpu,
+                (&args, 0),
                 (10, 16, 18),
-                Some(gpu + 12),
-                Some(&scratch),
-                Some(stats.GetGPUVirtualAddress())
-            ));
+                Some((&args, 12)),
+                Some((stats.GetGPUVirtualAddress(), 0)),
+                Writes::default(),
+                Output::Expanded,
+            )
+            .unwrap();
+            let (_out, written) = read_commands(&list, &commands, 4 + 24 * 28);
             list.close();
             host.execute(&[&list]);
             host.drain();
@@ -681,9 +993,10 @@ mod tests {
                 assert_eq!(pair, [0, 0, 0, 65535, 1, 1, 65535, 0, 0, 4465, 1, 1]);
             }
             let metrics = std::slice::from_raw_parts(counts.cast::<u32>(), 8);
-            assert_eq!(metrics, [u32::MAX, u32::MAX, u32::MAX, 17, 0, 1, 1, 17]);
+            assert_eq!(metrics, [u32::MAX, u32::MAX, u32::MAX, 1, 0, 1, 1, 17]);
             assert_eq!(counts.cast::<u32>().add(14).read_volatile(), 1);
-            assert_eq!(words[4], 70000);
+            assert_eq!(counts.cast::<u32>().add(15).read_volatile(), 14);
+            assert_eq!(words[4], 7000);
         }
     }
 
@@ -722,9 +1035,194 @@ mod tests {
     #[test]
     fn a_spent_budget_stays_spent() {
         let test = "indirect::tests::a_spent_budget_stays_spent";
-        let Some(twice) = clamped(test, 1, &[u32::MAX], 64, 2) else {
+        let Some(twice) = clamped(test, 1, &[1 << 24, 4, 0, 0, 0], 64, 2) else {
             return;
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+    #[test]
+    fn one_dispatch_bounds_two_executions_in_budget_order() {
+        let test = "indirect::tests::one_dispatch_bounds_two_executions_in_budget_order";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let list = host.new_list().unwrap();
+        let (args, data) = host.shared_buffer(48).unwrap();
+        // SAFETY: trois dessins dans notre tampon mappé, initialisés avant soumission.
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(data.cast::<u32>(), 12);
+            words.copy_from_slice(&[1 << 24, 4, 3, 8, 1 << 24, 4, 1, 7, 3, 1, 9, 4]);
+        }
+        let first = bound(
+            &list,
+            (&args, 0),
+            (0, 16, 2),
+            None,
+            None,
+            Writes::default(),
+            Output::Draw,
+        )
+        .unwrap();
+        let second = bound(
+            &list,
+            (&args, 32),
+            (0, 16, 1),
+            None,
+            None,
+            Writes::default(),
+            Output::Draw,
+        )
+        .unwrap();
+        assert!(first.dispatched && !second.dispatched);
+        let (_one, a) = read_commands(&list, &first, 52);
+        let (_two, b) = read_commands(&list, &second, 20);
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        // SAFETY: la copie est terminée, les deux tampons restent mappés.
+        unsafe {
+            assert_eq!(*a.cast::<[u32; 5]>(), [2, 1 << 24, 4, 3, 8]);
+            assert_eq!(*b.cast::<[u32; 5]>(), [1, 0, 0, 9, 4]);
+        }
+    }
+
+    #[test]
+    fn a_gpu_write_to_the_count_ends_the_run() {
+        let test = "indirect::tests::a_gpu_write_to_the_count_ends_the_run";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let _host = gpu.host();
+        let title = TitleList::new();
+        let list = title.host();
+        let args = TitleBuffer::new(256);
+        let count = TitleBuffer::new(256);
+        args.set_words(|_| 1);
+        count.set_words(|_| 1);
+        let (a, c) = (args.shadow(), count.shadow());
+        a.refresh(list, args.address(), 16);
+        c.refresh(list, count.address(), 4);
+        let run = || {
+            let writes = list.indirect_writes(&a.buffer, Some(&c.buffer));
+            bound(
+                list,
+                (&a.buffer, a.offset(args.address())),
+                (0, 16, 1),
+                Some((&c.buffer, c.offset(count.address()))),
+                None,
+                writes,
+                Output::Draw,
+            )
+            .unwrap()
+        };
+        let first = run();
+        let (_before, one) = read_commands(list, &first, 4);
+        assert!(crate::shadow::write(list, count.address() + 4, 7, 4));
+        assert!(run().dispatched, "autre mot du même tampon surveillé");
+        assert!(crate::shadow::write(list, count.address(), 0, 4));
+        let next = run();
+        assert!(first.dispatched && next.dispatched);
+        let (_after, zero) = read_commands(list, &next, 4);
+        title.run();
+        // SAFETY: la liste et les deux copies de leur compteur ont terminé.
+        unsafe {
+            assert_eq!(one.cast::<u32>().read_volatile(), 1);
+            assert_eq!(zero.cast::<u32>().read_volatile(), 0);
+        }
+    }
+
+    #[test]
+    fn a_dropped_execution_records_no_clamp() {
+        let test = "indirect::tests::a_dropped_execution_records_no_clamp";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let _host = gpu.host();
+        let list = TitleList::new();
+        let args = TitleBuffer::new(256);
+        args.set_words(|_| u32::MAX);
+        let mut state = crate::draw::State::default();
+        assert!(!state.execute_indirect(list.host(), (10, 12, 1), args.address(), None));
+        assert!(list.host().clamps.lock().unwrap().open.is_none());
+        list.run();
+    }
+
+    #[test]
+    fn native_prefix_precedes_the_split_and_its_suffix() {
+        let test = "indirect::tests::native_prefix_precedes_the_split_and_its_suffix";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let list = host.new_list().unwrap();
+        let (args, data) = host.shared_buffer(36).unwrap();
+        // SAFETY: trois dispatches du test, lus après leur initialisation.
+        unsafe {
+            data.cast::<[u32; 9]>()
+                .write([5, 2, 1, 70000, 1, 1, 2, 3, 4]);
+        }
+        let prefix = bound(
+            &list,
+            (&args, 0),
+            (2, 12, 3),
+            None,
+            None,
+            Writes::default(),
+            Output::NativePrefix,
+        )
+        .unwrap();
+        let skip = (prefix.native_offset.unwrap() - prefix.offset) as usize / 4;
+        let (_read, data) = read_commands(&list, &prefix, (skip as u64 + 4) * 4);
+        let compact = bound(
+            &list,
+            (&args, 0),
+            (2, 12, 3),
+            None,
+            None,
+            Writes::default(),
+            Output::Native,
+        )
+        .unwrap();
+        let (_compact, packed) = read_commands(&list, &compact, 4 + 4 * 12);
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        // SAFETY: les deux tranches copiées sont mappées et la soumission est terminée.
+        unsafe {
+            let words = std::slice::from_raw_parts(data.cast::<u32>(), skip + 4);
+            assert_eq!(&words[skip..], [1, 5, 2, 1]);
+            assert_eq!(
+                &words[..19],
+                [
+                    3, 0, 0, 0, 65535, 1, 1, 65535, 0, 0, 4465, 1, 1, 0, 0, 0, 2, 3, 4
+                ]
+            );
+            assert_eq!(
+                *packed.cast::<[u32; 13]>(),
+                [4, 5, 2, 1, 65535, 1, 1, 4465, 1, 1, 2, 3, 4]
+            );
+        }
+    }
+
+    #[test]
+    fn direct_grids_are_bounded_before_splitting() {
+        assert_eq!(direct_groups([u32::MAX; 3], false), None);
+        assert_eq!(
+            direct_groups([MAX_GROUPS, 1, 1], false),
+            Some([MAX_GROUPS, 1, 1])
+        );
+        assert_eq!(direct_groups([1, MAX_GROUPS + 1, 1], true), None);
+        assert_eq!(direct_groups([1000, 2, 3], true), Some([6000, 1, 1]));
+        assert_eq!(direct_groups([1000, 2, 3], false), Some([1000, 2, 3]));
+    }
+
+    #[test]
+    fn corrupt_draws_run_empty() {
+        let test = "indirect::tests::corrupt_draws_run_empty";
+        let Some(out) = clamped(test, 0, &[u32::MAX, u32::MAX, 0, 0], 1, 1) else {
+            return;
+        };
+        assert_eq!(out, [0]);
     }
 }

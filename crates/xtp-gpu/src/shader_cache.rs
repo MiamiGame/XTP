@@ -330,7 +330,7 @@ pub(crate) fn wave64_program(
 /// reads the runtime stride table (VIctory #193) and the buffers it reads
 /// through slots picked at run time.
 /// Version 3 ajoute la base XYZ des dispatches fractionnés.
-const MAGIC: &[u8; 4] = b"VSH3";
+const MAGIC: &[u8; 4] = b"VSH4";
 /// A refusal's entry: this, then the text's length (little endian, 4 bytes),
 /// then a checksum of the text (4 bytes), then the error's text (UTF-8). The
 /// length tells a cut-short entry from a shorter error, and the checksum
@@ -440,7 +440,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
@@ -503,6 +503,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let root_uavs = r.list()?;
     let stride_table = match r.word()? {
         0 => false,
         1 => true,
@@ -523,6 +524,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        root_uavs,
         stride_table,
         run_time_buffers,
     })
@@ -597,6 +599,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            root_uavs: vec![1],
             stride_table: true,
             run_time_buffers: 3,
             group_base: Some(12),

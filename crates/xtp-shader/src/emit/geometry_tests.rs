@@ -39,6 +39,7 @@ const M0: u8 = 124;
 const S_MOV_B32: u32 = 0x03;
 const S_SETPC_B64: u32 = 0x20;
 const S_ADD_U32: u32 = 0x00;
+const S_SUB_U32: u32 = 0x01;
 const S_LSHL_B32: u32 = 0x1E;
 const S_MUL_I32: u32 = 0x26;
 const S_BFE_U32: u32 = 0x27;
@@ -49,6 +50,7 @@ const S_CSELECT_B32: u32 = 0x0A;
 const S_CSELECT_B64: u32 = 0x0B;
 const S_ENDPGM: u32 = 0xBF81_0000;
 const S_BRANCH: u32 = 0x02;
+const S_CBRANCH_SCC0: u32 = 0x04;
 const S_CBRANCH_SCC1: u32 = 0x05;
 const S_BARRIER: u32 = 0xBF8A_0000;
 const V_MOV_B32: u32 = 0x01;
@@ -77,6 +79,8 @@ const DONE_EMIT_CUT: u32 = DONE | 3 << 4;
 const S_AND_SAVEEXEC_B64: u32 = 0x24;
 const S_OR_B64: u32 = 0x11;
 const EXEC: u8 = 126;
+/// VCC's operand code (its low dword; a 64-bit operand takes the pair).
+const VCC: u32 = 106;
 
 /// A VGPR as a 9-bit source operand.
 fn vgpr(n: u8) -> u32 {
@@ -164,14 +168,24 @@ impl Code {
         self.labels.insert(name, self.words.len());
     }
 
-    fn program(mut self) -> Program {
+    /// The words, each branch to its label (before or after it).
+    fn resolved(mut self) -> Vec<u32> {
         for &(at, to) in &self.branches {
             let skip = self.labels[to] as i32 - at as i32 - 1;
             self.words[at] |= u32::from(skip as i16 as u16);
         }
-        let bytes: Vec<u8> = self.words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        ir::build(&bytes, true, 64).expect("a program the IR builds")
+        self.words
     }
+
+    fn program(self) -> Program {
+        program_of(&self.resolved())
+    }
+}
+
+/// The wave64 program of the code `words`.
+fn program_of(words: &[u32]) -> Program {
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    ir::build(&bytes, true, 64).expect("a program the IR builds")
 }
 
 /// The GS vertices' dwords in these tests: four rows (position, a uint,
@@ -225,11 +239,23 @@ const PRELUDE_SETUP: usize = 14;
 /// Writes vertex `n` from input vertex `k`: its position, `100 + n`, its
 /// four floats and its uint.
 fn gs_vertex(code: &mut Code, n: u32, k: u8) {
+    gs_vertex_with(code, n, k, false);
+}
+
+/// [`gs_vertex`]; with `fill`, `100 + n` goes in with the rest of its
+/// short row (`ds_write2_b64` of v[60:61] and v[2:3]): dwords 5 to 7, which
+/// no output element holds, then get v61 (never set) and the GS half's
+/// system VGPRs 2 and 3, which have no host value.
+fn gs_vertex_with(code: &mut Code, n: u32, k: u8, fill: bool) {
     let (b, d) = (20 + 10 * k, (VERTEX_DWORDS * n) as u8);
     code.add([vop1(V_MOV_B32, 60, LITERAL), 100 + n]);
     code.add(ds(DS_WRITE2_B32, 0, 13, [b, b + 1], d, d + 1));
     code.add(ds(DS_WRITE2_B32, 0, 13, [b + 2, b + 3], d + 2, d + 3));
-    code.add(ds_at(DS_WRITE_B32, 0, 13, 60, 4 * (u16::from(d) + 4)));
+    if fill {
+        code.add(ds(DS_WRITE2_B64, 0, 13, [60, 2], d / 2 + 2, d / 2 + 3));
+    } else {
+        code.add(ds_at(DS_WRITE_B32, 0, 13, 60, 4 * (u16::from(d) + 4)));
+    }
     code.add(ds(
         DS_WRITE2_B64,
         0,
@@ -261,12 +287,17 @@ fn gs_program(steps: &[Step], max_vertices: u32) -> Program {
 
 /// [`gs_program`]'s code, after what `code` holds.
 fn gs_code(code: &mut Code, steps: &[Step], max_vertices: u32) {
+    gs_code_with(code, steps, max_vertices, false);
+}
+
+/// [`gs_code`], each vertex written as [`gs_vertex_with`] `fill` writes it.
+fn gs_code_with(code: &mut Code, steps: &[Step], max_vertices: u32, fill: bool) {
     gs_prelude(code, max_vertices * VERTEX_DWORDS * 4);
     let mut n = 0;
     for &step in steps {
         match step {
             Step::Emit(k) | Step::EmitCut(k) | Step::EmitDone(k) => {
-                gs_vertex(code, n, k);
+                gs_vertex_with(code, n, k, fill);
                 code.add([match step {
                     Step::Emit(_) => EMIT,
                     Step::EmitCut(_) => EMIT_CUT,
@@ -434,12 +465,25 @@ fn es_code() -> Code {
 const ES_CONSTANTS: [f32; 8] = [0.5, 0.25, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0];
 
 fn es_tail(code: &mut Code) {
+    es_tail_with(code, false);
+}
+
+/// [`es_tail`]; with `fill`, the vertex id goes in with the rest of its
+/// short last row (`ds_write2_b64` of v[5:6] and v[0:1]): item dwords 9 to
+/// 11, which no output element holds, then get v6 (never set) and the GS
+/// half's system VGPRs 0 and 1, which have no host value in the ES.
+fn es_tail_with(code: &mut Code, fill: bool) {
     for (k, c) in ES_CONSTANTS.iter().enumerate().skip(4) {
         code.add([vop1(V_MOV_B32, 16 + k as u8, LITERAL), c.to_bits()]);
     }
     code.add(ds(DS_WRITE2_B32, 0, 15, [20, 21], 4, 5));
     code.add(ds(DS_WRITE2_B32, 0, 15, [22, 23], 6, 7));
-    code.add(ds_at(DS_WRITE_B32, 0, 15, crate::io::ES_VERTEX_ID, 32));
+    let id = crate::io::ES_VERTEX_ID;
+    if fill {
+        code.add(ds(DS_WRITE2_B64, 0, 15, [id, 0], 4, 5));
+    } else {
+        code.add(ds_at(DS_WRITE_B32, 0, 15, id, 32));
+    }
     code.add([S_BARRIER, sop1(S_SETPC_B64, 0, 6)]);
 }
 
@@ -1625,11 +1669,16 @@ fn geometry_es_and_gs_pair_streams_out() {
 /// lane set-up first, as the translation takes it: the ES beside its
 /// output signature (the ring item's rows).
 fn es_container() -> (Vec<u8>, NativeProgram) {
+    es_container_with(false)
+}
+
+/// [`es_container`], its tail as [`es_tail_with`] `fill` writes it.
+fn es_container_with(fill: bool) -> (Vec<u8>, NativeProgram) {
     let mut code = Code::default();
     lane_prologue(&mut code, 0);
     code.add(es_code().words);
     es_position(&mut code, ES_CONSTANTS[..4].try_into().unwrap());
-    es_tail(&mut code);
+    es_tail_with(&mut code, fill);
     let out = |usage, row| VsOutput {
         usage,
         row,
@@ -1661,6 +1710,12 @@ fn gs_container(steps: &[Step], psv: bool) -> (Vec<u8>, NativeProgram) {
     let mut code = Code::default();
     lane_prologue(&mut code, 8);
     gs_code(&mut code, steps, 3);
+    gs_container_of(&code.resolved(), psv)
+}
+
+/// [`gs_container`] of the code `words` (lane set-up included), a GS of
+/// [`shape`]`(3)`.
+fn gs_container_of(words: &[u32], psv: bool) -> (Vec<u8>, NativeProgram) {
     let mut gs_io = gs_io(3, 1);
     gs_io.outputs = (0..4)
         .map(|row| VsOutput {
@@ -1675,7 +1730,7 @@ fn gs_container(steps: &[Step], psv: bool) -> (Vec<u8>, NativeProgram) {
             pack2: false,
         })
         .collect();
-    let native = merged_native(HwStage::Gs, &code.words, StageIo::Gs(gs_io));
+    let native = merged_native(HwStage::Gs, words, StageIo::Gs(gs_io));
     let (isg1, osg1) = (
         container::signature(&item(), true),
         container::signature(&outputs(), false),
@@ -1761,4 +1816,122 @@ fn geometry_pair_translates_and_streams_out() {
         }
     }
     assert_eq!(records(&words), want);
+}
+
+/// What the translation stops a merged half with, if anything.
+fn refusal((container, native): (Vec<u8>, NativeProgram)) -> Option<&'static str> {
+    let c = Container::parse(&container).expect("a container");
+    match super::translate_program(&c, &native) {
+        Ok(_) => None,
+        Err((_, crate::ShaderError::Unsupported { what, .. })) => Some(what),
+        Err((step, e)) => panic!("{}: {e}", step.name()),
+    }
+}
+
+/// Draws the pair `vs`, `gs` over two triangles of the ES-made vertex
+/// shader and checks that each GS invocation emits its input vertices 0, 1
+/// and 2 in order, as the console's copy shader reads them from the ring;
+/// nothing on a machine without a device.
+fn streams_out_vertices_in_order(vs: &HostShader, gs: &HostShader) {
+    let Some((host, _one)) = device() else {
+        return;
+    };
+    let words = stream_out(&host, &vs.dxil, &gs.dxil, &outputs(), 6).expect("a draw");
+    let mut want = Vec::new();
+    for prim in 0..2 {
+        for k in 0..3 {
+            want.push(record(es_word, prim, k as u32, k));
+        }
+    }
+    assert_eq!(records(&words), want);
+}
+
+/// A row-filling write into a short last row (Codex review 3983f844, P2):
+/// the ES writes its vertex id with item dwords 9 to 11 (`ds_write2_b64`),
+/// the GS each vertex's `100 + n` with its dwords 5 to 7, and those dwords
+/// hold values with no host form (the GS half's system VGPRs). No output
+/// element holds them, so nothing reads them: both halves translate (each
+/// was refused before, "a pixel system input"), and the pair streams out
+/// what the console's copy shader reads.
+#[test]
+fn geometry_short_rows_filled_with_unread_values_translate() {
+    let vs = translated("the ES filling its last row", es_container_with(true));
+    let steps = [Step::Emit(0), Step::Emit(1), Step::Emit(2), Step::Done];
+    let mut code = Code::default();
+    lane_prologue(&mut code, 8);
+    gs_code_with(&mut code, &steps, 3, true);
+    let gs = translated(
+        "the GS filling its vertices' short row",
+        gs_container_of(&code.resolved(), true),
+    );
+    streams_out_vertices_in_order(&vs, &gs);
+}
+
+/// `v_cmp_ne_u32 vcc, src0, v<vsrc1>`.
+fn v_cmp_ne_u32(src0: u32, vsrc1: u8) -> u32 {
+    0x7C00_0000 | 0xC5 << 17 | u32::from(vsrc1) << 9 | src0
+}
+
+/// A geometry shader of [`shape`]`(3)` (lane set-up first) whose vertex 0
+/// is written `passes` times by the same instructions (a loop on s50 where
+/// `passes` is above 1), then emitted after them, then vertices 1 and 2.
+/// With `masked`, each pass writes it under an EXEC narrowed without a
+/// branch to the lanes whose input vertex 0 has a nonzero dword 0
+/// (`s_and_saveexec_b64` of a compare), restored after the write, so that
+/// the emits run under the entry's mask.
+fn gs_vertex_in_a_loop(masked: bool, passes: u32) -> Vec<u32> {
+    let mut code = Code::default();
+    lane_prologue(&mut code, 8);
+    gs_prelude(&mut code, 3 * VERTEX_DWORDS * 4);
+    code.add([sop1(S_MOV_B32, 50, int(passes))]);
+    code.label("pass");
+    if masked {
+        code.add([v_cmp_ne_u32(int(0), 20), sop1(S_AND_SAVEEXEC_B64, 40, VCC)]);
+    }
+    gs_vertex(&mut code, 0, 0);
+    if masked {
+        code.add([sop2(S_OR_B64, EXEC, u32::from(EXEC), 40)]);
+    }
+    if passes > 1 {
+        code.add([
+            sop2(S_SUB_U32, 50, 50, int(1)),
+            sopc(S_CMP_EQ_U32, 50, int(0)),
+        ]);
+        code.branch(S_CBRANCH_SCC0, "pass");
+    }
+    code.add([EMIT]);
+    gs_vertex(&mut code, 1, 1);
+    code.add([EMIT]);
+    gs_vertex(&mut code, 2, 2);
+    code.add([EMIT, CUT, DONE, S_ENDPGM]);
+    code.resolved()
+}
+
+/// A GSVS write in a loop under a narrowed EXEC (Codex review 3983f844,
+/// P1): a lane the mask leaves out of a later pass keeps in the ring what
+/// an earlier pass wrote, where the host keeps the last pass's value, so
+/// it is refused. The plan takes the program (one write per dword on the
+/// paths to the emit, before it); the lowering finds the guard. In a loop
+/// with every lane writing, or under the mask without a loop (a lane left
+/// out holds nothing the program wrote), it translates and streams out
+/// what the console does (every lane passes the compare here).
+#[test]
+fn geometry_masked_write_in_a_loop_is_refused() {
+    let mut p = program_of(&gs_vertex_in_a_loop(true, 2));
+    geometry::drop_lane_prologue(&mut p, HwStage::Gs).expect("the title's set-up");
+    let plan = geometry::gs_plan(&p, &shape(3)).expect("a plan");
+    assert_eq!(plan.looped.len(), 5, "vertex 0's five writes: {plan:?}");
+    assert_eq!(
+        refusal(gs_container_of(&gs_vertex_in_a_loop(true, 2), true)),
+        Some(geometry::LOOPED)
+    );
+    let vs = translated("the ES", es_container());
+    for (masked, passes) in [(false, 2), (true, 1)] {
+        let what = format!("the GS, masked {masked}, {passes} passes");
+        let gs = translated(
+            &what,
+            gs_container_of(&gs_vertex_in_a_loop(masked, passes), true),
+        );
+        streams_out_vertices_in_order(&vs, &gs);
+    }
 }

@@ -3,7 +3,7 @@
 //! R3 (structured buffers of unknown stride: through the host's runtime
 //! stride table, [`Lower::runtime_access`]).
 
-use super::descriptor::{Entry, UNKNOWN_STRIDE};
+use super::descriptor::{Entry, ODD_STRIDE, SMALL_STRIDE, UNKNOWN_STRIDE};
 use super::{Lower, Why};
 use crate::emit::bitcode::{Attr, Bin, Cast, V, pred};
 use crate::emit::shader::flags;
@@ -304,7 +304,7 @@ impl<'a> Lower<'a> {
             return Err(name);
         }
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.effect_guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
@@ -323,6 +323,7 @@ impl<'a> Lower<'a> {
             Some("cmpswap") => Some(u32::MAX),
             Some(_) => return Err(name),
         };
+        let halfword = matches!(name, "buffer_load_ushort" | "buffer_store_short");
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
@@ -331,7 +332,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || halfword => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -362,6 +363,12 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
+        if halfword
+            && !(built.is_some()
+                && used.is_some_and(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav)))
+        {
+            return Err(name);
+        }
         let add_tid = built.is_some_and(|(d, _)| d.add_tid_enable);
         let mut valid = self.s.m.bool(true);
         let index = if add_tid {
@@ -374,9 +381,14 @@ impl<'a> Lower<'a> {
             format.is_some() && built.is_some_and(|(d, _)| index.is_some() || d.swizzle_enable);
         let raw = !typed
             && !used.is_some_and(|r| r.kind == ResourceType::Cbv)
-            && (built.is_some_and(|(d, _)| {
-                crate::emit::raw_structured() || add_tid || d.swizzle_enable
-            }) || self.through_table(index, used, src)?
+            && (halfword
+                || built.is_some_and(|(d, _)| {
+                    crate::emit::raw_structured()
+                        || add_tid
+                        || d.swizzle_enable
+                        || used.is_some_and(|u| u.kind == ResourceType::Uav)
+                })
+                || self.through_table(index, used, src)?
                 || (index.is_some() && crate::emit::raw_structured()));
         let mut within = self.s.m.i32(u32::from(*offset));
         if *offen {
@@ -477,6 +489,83 @@ impl<'a> Lower<'a> {
                 },
             })
         };
+        if typed
+            && let Some((desc, _)) = built
+            // Pour un TBUFFER sur SRV, le format vient de l'instruction.
+            // Le chemin de lecture brut existant le décode déjà.
+            && used.is_some_and(|u| u.kind == ResourceType::Uav
+                || u.kind == ResourceType::Srv && format.is_none())
+        {
+            // La vue hôte reste brute. Les canaux de 32 bits conservent
+            // leur représentation pour FLOAT, UINT et SINT.
+            let format = format.unwrap_or(desc.format);
+            let (bits, _) = buffer_format(format).ok_or("a root buffer format")?;
+            if d16 || desc.dst_sel != [4, 5, 6, 7] {
+                return Err("a packed or swizzled typed root view");
+            }
+            let Some(d @ Operand::Vector { reg, .. }) = data else {
+                return Err(name);
+            };
+            if store && (count as usize != bits.len() || bits.iter().any(|&n| n != 32)) {
+                return Err("a partial or packed typed root store");
+            }
+            let view = raw_view(self)?;
+            let RawView::Built { handle, .. } = view else {
+                unreachable!()
+            };
+            let width = bits.iter().sum::<u32>() / 8;
+            let range = self.raw_range(view, address);
+            let byte = range.byte;
+            let valid = self.raw_fits(range, width);
+            let enabled = guard.map_or(valid, |g| self.s.m.bin(self.cur, Bin::And, g, valid));
+            let values = if store {
+                self.vgprs(inst, d, count as u8)?
+            } else {
+                Vec::new()
+            };
+            let xs = self.guarded_values(Some(enabled), |l| {
+                if !store {
+                    return l.format_load(handle, byte, format, count, range.word_stride);
+                }
+                for (k, &value) in values.iter().enumerate() {
+                    let delta = l.s.m.i32(k as u32 * range.word_stride);
+                    let at = l.s.m.bin(l.cur, Bin::Add, byte, delta);
+                    l.raw_store_dword(handle, at, value);
+                }
+                Ok(Vec::new())
+            })?;
+            for (k, x) in xs.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
+        if halfword {
+            let Some(d @ Operand::Vector { reg, .. }) = data else {
+                return Err(name);
+            };
+            let source = if store {
+                Some(self.vgprs(inst, d, 1)?[0])
+            } else {
+                None
+            };
+            let view = raw_view(self)?;
+            let RawView::Built { handle, .. } = view else {
+                unreachable!()
+            };
+            if view.word_stride() != 4 {
+                return Err("a swizzled halfword access");
+            }
+            let range = self.raw_range(view, address);
+            let byte = range.byte;
+            let valid = self.raw_fits(range, 2);
+            let enabled = guard.map_or(valid, |g| self.s.m.bin(self.cur, Bin::And, g, valid));
+            let xs =
+                self.guarded_values(Some(enabled), |l| Ok(l.raw_halfword(handle, byte, source)))?;
+            if !store {
+                self.write(inst, Reg::V(*reg), xs[0], guard);
+            }
+            return Ok(());
+        }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
@@ -729,13 +818,19 @@ impl<'a> Lower<'a> {
     /// host makes structured views raw then, and a structured handle over
     /// a raw view reads zeros on NVIDIA (watch.md item 160); the table's
     /// raw views are raw over raw whatever the slot holds.
+    ///
+    /// The refusals say which stride they saw (watch.md item 318): none
+    /// ([`UNKNOWN_STRIDE`], what the table translates), 1 to 3 bytes
+    /// ([`SMALL_STRIDE`]), or another off a multiple of 4 ([`ODD_STRIDE`]).
     fn runtime_stride(&self, used: Option<&UsedResource>) -> Result<bool, Why> {
         match used.map_or(0, |u| u.stride) {
             s if s >= 4 && s.is_multiple_of(4) => {
                 Ok(self.x.target.stride_table && crate::emit::raw_structured())
             }
             0 if self.x.target.stride_table => Ok(true),
-            _ => Err(UNKNOWN_STRIDE),
+            0 => Err(UNKNOWN_STRIDE),
+            1..=3 => Err(SMALL_STRIDE),
+            _ => Err(ODD_STRIDE),
         }
     }
 
@@ -865,7 +960,7 @@ impl<'a> Lower<'a> {
 
     /// Conserve la retenue dans le prédicat pour qu'une adresse au-delà
     /// de 4 Gio ne revienne jamais au début de la vue D3D.
-    fn raw_add(&mut self, a: V, b: V, valid: &mut V) -> V {
+    pub(super) fn raw_add(&mut self, a: V, b: V, valid: &mut V) -> V {
         let zero = self.s.m.i32(0);
         if a == zero {
             return b;
@@ -1010,6 +1105,56 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Demi-mot du constructeur, y compris à cheval sur deux dwords.
+    /// D'après Marvisak/VIctory#1572 (head 0c16661) by iurysf et
+    /// fxceless's VIctory fork (4e17478) pour les écritures par masque.
+    fn raw_halfword(&mut self, h: V, byte: V, source: Option<V>) -> Vec<V> {
+        let c = self.cur;
+        let mask = self.s.m.i32(0xff);
+        let three = self.s.m.i32(3);
+        let aligned = self.s.m.i32(!3);
+        let mut result = self.s.m.i32(0);
+        for k in 0..2 {
+            let delta = self.s.m.i32(k);
+            let addr = self.s.m.bin(c, Bin::Add, byte, delta);
+            let word = self.s.m.bin(c, Bin::And, addr, aligned);
+            let within = self.s.m.bin(c, Bin::And, addr, three);
+            let shift = self.s.m.bin(c, Bin::Shl, within, three);
+            let field = self.s.m.i32(k * 8);
+            if let Some(value) = source {
+                let bits = self.s.m.bin(c, Bin::LShr, value, field);
+                let bits = self.s.m.bin(c, Bin::And, bits, mask);
+                let set = self.s.m.bin(c, Bin::Shl, bits, shift);
+                let changed = self.s.m.bin(c, Bin::Shl, mask, shift);
+                let ones = self.s.m.i32(u32::MAX);
+                let keep = self.s.m.bin(c, Bin::Xor, changed, ones);
+                let u = self.s.m.undef(self.s.t.i32);
+                for (op, bits) in [(1, keep), (2, set)] {
+                    let op = self.s.m.i32(op);
+                    self.s.op(
+                        c,
+                        "atomicBinOp.i32",
+                        Attr::NoUnwind,
+                        self.s.t.i32,
+                        78,
+                        &[h, op, word, u, u, bits],
+                    );
+                }
+            } else {
+                let bits = self.raw_words(h, word, 1)[0];
+                let bits = self.s.m.bin(c, Bin::LShr, bits, shift);
+                let bits = self.s.m.bin(c, Bin::And, bits, mask);
+                let bits = self.s.m.bin(c, Bin::Shl, bits, field);
+                result = self.s.m.bin(c, Bin::Or, result, bits);
+            }
+        }
+        if source.is_some() {
+            Vec::new()
+        } else {
+            vec![result]
+        }
+    }
+
     fn raw_store_dword(&mut self, h: V, byte: V, value: V) {
         let undef = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8(1);
@@ -1024,7 +1169,21 @@ impl<'a> Lower<'a> {
         );
     }
 
-    fn raw_words(&mut self, h: V, byte: V, count: u32) -> Vec<V> {
+    pub(super) fn constant_read_handle(
+        &mut self,
+        read: crate::resource::ConstantRead,
+        scalar: bool,
+    ) -> V {
+        let kind = match (read.packed, scalar) {
+            (true, _) => crate::emit::PACKED_ADDRESS_SRV,
+            (false, true) => crate::emit::SCALAR_ADDRESS_SRV,
+            (false, false) => crate::emit::VECTOR_ADDRESS_SRV,
+        };
+        let index = self.host_word(kind, read.slot, read.dword);
+        self.s.heap_handle(self.cur, index, false, false, (11, 0))
+    }
+
+    pub(super) fn raw_words(&mut self, h: V, byte: V, count: u32) -> Vec<V> {
         let undef = self.s.m.undef(self.s.t.i32);
         let mask = self.s.m.i8((1 << count) - 1);
         let align = self.s.m.i32(4);
@@ -1154,29 +1313,41 @@ impl<'a> Lower<'a> {
             "sshort" => (1, Some((16, true))),
             _ => return Err(name),
         };
+        let guard = self.effect_guard(b, i)?;
+        let Some(Operand::Vector { reg, .. }) = *dst else {
+            return Err("a global load result");
+        };
+        if let Some(&read) = self.x.res.constant_reads.get(&(b, i)) {
+            let h = self.constant_read_handle(read, false);
+            for k in 0..n {
+                let at = self.s.m.i32(read.offset + 4 * k);
+                let x = self.raw_words(h, at, 1)[0];
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let a = *self
             .scalar
             .get(&(b, i))
             .ok_or("an untracked global address")?;
-        let guard = self.guard(b, i)?;
-        let Some(Operand::Vector { reg, .. }) = *dst else {
-            return Err("a global load result");
-        };
         let c = self.cur;
-        let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let (base, extra) = self.built_offset(&src)?;
+        let mut off = self.s.m.i32(base);
+        if let Some(d) = extra {
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
         let h = if a.param == CODE {
             None
         } else {
-            let src = Source::Built {
-                address: a,
-                bits: 0,
-                words: [0, 0],
-            };
-            Some(self.handle((b, i), &src, false, (11, 0))?)
+            let uav = self
+                .used_kind(&src)
+                .is_some_and(|u| u.kind == ResourceType::Uav);
+            Some(self.handle((b, i), &src, false, (if uav { 11 | 0x1000 } else { 11 }, 0))?)
         };
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {

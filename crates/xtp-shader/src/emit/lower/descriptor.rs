@@ -5,8 +5,8 @@
 //! host's runtime stride table: [`Lower::stride_entry`]).
 
 use super::{Lower, Val, Why};
-use crate::emit::StrideEntry;
-use crate::emit::bitcode::{Attr, Bin, V};
+use crate::emit::bitcode::{Attr, Bin, V, pred};
+use crate::emit::{REMAPPED_SLOT, STRIDE_HEADER, StrideEntry};
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{Inst, Reg};
 use crate::native::{ResourceType, RootType, UsedResource};
@@ -14,6 +14,16 @@ use crate::resource::{Site, Source};
 
 /// What the refusal of a buffer read by element without a stride says.
 pub(super) const UNKNOWN_STRIDE: Why = "a structured buffer of unknown stride";
+
+/// What the refusal of a buffer read by element with a known stride of 1
+/// to 3 bytes says (an R8 or R16 structured buffer, watch.md item 318):
+/// counted apart from unknown strides, which the runtime stride table
+/// translates.
+pub(super) const SMALL_STRIDE: Why = "a structured buffer of stride 1 to 3";
+
+/// What the refusal of a buffer read by element with a known stride past 4
+/// but off a multiple of 4 says (watch.md item 318).
+pub(super) const ODD_STRIDE: Why = "a structured buffer of stride off a multiple of 4";
 
 /// A runtime stride table entry ([`StrideEntry`]) as a program reads it.
 #[derive(Debug, Clone, Copy)]
@@ -40,6 +50,24 @@ impl<'a> Lower<'a> {
                 let x = match address.dynamic {
                     Some(v) => Some(self.i32_of(v)?),
                     None => None,
+                };
+                let x = if self
+                    .used_kind(src)
+                    .is_some_and(|u| u.kind == ResourceType::Uav)
+                {
+                    let bias = self.host_word(
+                        crate::emit::ROOT_UAV_BIAS,
+                        self.x.native.layout[address.param].slot,
+                        0,
+                    );
+                    Some(x.map_or(bias, |v| {
+                        let mut valid = self.s.m.bool(true);
+                        let sum = self.raw_add(v, bias, &mut valid);
+                        let max = self.s.m.i32(u32::MAX);
+                        self.s.m.select(self.cur, valid, sum, max)
+                    }))
+                } else {
+                    x
                 };
                 Ok((address.offset, x))
             }
@@ -197,30 +225,27 @@ impl<'a> Lower<'a> {
                     .layout
                     .get(address.param)
                     .ok_or("a descriptor built around a table in the code")?;
-                let kind = self
-                    .x
-                    .native
-                    .used
-                    .iter()
-                    .find(|u| u.user_data == rp.user_data)
-                    .map(|u| u.kind);
+                let kind = self.used_kind(src).map(|u| u.kind);
                 match (rp.root, kind, props.0) {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
-                        Ok(self.s.root_srv_handle(rp.slot))
+                        Ok(self.s.root_raw_handle(rp.slot, false))
                     }
-                    _ => Err("a root UAV or typed root view"),
+                    (RootType::Descriptor, Some(ResourceType::Uav), 0x100b) => {
+                        Ok(self.s.root_raw_handle(rp.slot, true))
+                    }
+                    _ => Err("a typed or incompatible root view"),
                 }
             }
             Source::Phi { block, args } => {
                 let _ = site;
-                let phi = self.phi_heap_index(*block, args, sampler)?;
+                let phi = self.phi_heap_index(*block, args, sampler, false)?;
                 Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
             }
             Source::Select { scc, args } => {
-                let index = self.select_heap_index(*scc, args, sampler)?;
+                let index = self.select_heap_index(*scc, args, sampler, false)?;
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
@@ -235,8 +260,15 @@ impl<'a> Lower<'a> {
 
     /// The heap index of a descriptor chosen by control flow: each
     /// predecessor of `block` computes its own at its end, the join picks
-    /// one with a phi.
-    fn phi_heap_index(&mut self, block: usize, args: &[Source], sampler: bool) -> Result<V, Why> {
+    /// one with a phi. `marked`: with [`REMAPPED_SLOT`] where the user data
+    /// has it ([`Self::marked_heap_index`]).
+    fn phi_heap_index(
+        &mut self,
+        block: usize,
+        args: &[Source],
+        sampler: bool,
+        marked: bool,
+    ) -> Result<V, Why> {
         let mut incoming = Vec::new();
         for (&q, arg) in self.x.p.blocks[block].preds.iter().zip(args) {
             if self.block[q].is_none() {
@@ -247,7 +279,7 @@ impl<'a> Lower<'a> {
             };
             let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
             let here = std::mem::replace(&mut self.cur, at);
-            let index = self.heap_index(*load, *first, sampler);
+            let index = self.index_of(*load, *first, sampler, marked);
             self.cur = here;
             incoming.push((index?, at));
         }
@@ -257,12 +289,14 @@ impl<'a> Lower<'a> {
         Ok(phi)
     }
 
-    /// The heap index of a descriptor of two picked by SCC (uniform).
+    /// The heap index of a descriptor of two picked by SCC (uniform);
+    /// `marked` as for [`Self::phi_heap_index`].
     fn select_heap_index(
         &mut self,
         scc: crate::ir::Value,
         args: &[Source],
         sampler: bool,
+        marked: bool,
     ) -> Result<V, Why> {
         let [
             Source::Loaded { load: a, first: fa },
@@ -275,30 +309,32 @@ impl<'a> Lower<'a> {
             Val::Bit(x) => x,
             _ => return Err("SCC without a value"),
         };
-        let set = self.heap_index(a, fa, sampler)?;
-        let clear = self.heap_index(b, fb, sampler)?;
+        let set = self.index_of(a, fa, sampler, marked)?;
+        let clear = self.index_of(b, fb, sampler, marked)?;
         Ok(self.s.m.select(self.cur, cond, set, clear))
     }
 
     /// The view-heap slot of `src`'s descriptor as [`Self::handle`] computes
-    /// it, in the current block, and whether it may differ between lanes.
+    /// it, in the current block, with [`REMAPPED_SLOT`] where the user data
+    /// has it, and whether it may differ between lanes.
     fn heap_slot(&mut self, src: &Source) -> Result<(V, bool), Why> {
         let waterfall = |l: &Self, s: &Source| matches!(s, Source::Loaded { load, .. } if l.x.res.waterfall.loads.contains(load));
         match src {
-            Source::Loaded { load, first } => {
-                Ok((self.heap_index(*load, *first, false)?, waterfall(self, src)))
-            }
+            Source::Loaded { load, first } => Ok((
+                self.marked_heap_index(*load, *first, false)?,
+                waterfall(self, src),
+            )),
             Source::Phi { block, args } => {
                 // A waterfall load picks a slot per lane, so does a phi of one.
                 let lanes = args.iter().any(|a| waterfall(self, a));
-                Ok((self.phi_heap_index(*block, args, false)?, lanes))
+                Ok((self.phi_heap_index(*block, args, false, true)?, lanes))
             }
             Source::Select { scc, args } => {
                 let lanes = args.iter().any(|a| waterfall(self, a));
-                Ok((self.select_heap_index(*scc, args, false)?, lanes))
+                Ok((self.select_heap_index(*scc, args, false, true)?, lanes))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
-                Ok((self.lane_heap_index(src, false)?, true))
+                Ok((self.lanes_heap_index(src, false, true)?, true))
             }
             Source::Constant(_) | Source::Built { .. } => Err(UNKNOWN_STRIDE),
         }
@@ -308,6 +344,12 @@ impl<'a> Lower<'a> {
     /// [`crate::emit::STRIDE_SPACE`]) of the view-heap slot of `src`, read
     /// in the current block: one load of its two dwords, which the host
     /// writes with one store.
+    ///
+    /// The table is a root SRV, which bounds no read, so the entry is read
+    /// only inside it: past its header ([`STRIDE_HEADER`]), for a slot the
+    /// host remapped ([`REMAPPED_SLOT`]) below the entries the header
+    /// counts, for a title slot below the title slots the host mirrors.
+    /// Any other slot reads the header's first entry, which holds no view.
     pub(super) fn stride_entry(&mut self, src: &Source) -> Result<Entry, Why> {
         let key = match src {
             Source::Loaded { load, first } => Some((self.cur, *load, *first)),
@@ -319,8 +361,37 @@ impl<'a> Lower<'a> {
         let (slot, nonuniform) = self.heap_slot(src)?;
         let c = self.cur;
         let table = self.s.stride_table_handle();
+        // The header: [0, title slots mirrored, 0, entries].
+        let (zero, iu, all, align) = (
+            self.s.m.i32(0),
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i8(0xF),
+            self.s.m.i32(4),
+        );
+        let header = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, zero, iu, all, align],
+        );
+        let mirrored = self.s.m.extract(c, header, 1);
+        let mirrored = self.as_int(mirrored);
+        let entries = self.s.m.extract(c, header, 3);
+        let entries = self.as_int(entries);
+        let mark = self.s.m.i32(REMAPPED_SLOT);
+        let marked = self.s.m.bin(c, Bin::And, slot, mark);
+        let remapped = self.s.m.cmp(c, pred::NE, marked, zero);
+        let keep = self.s.m.i32(!REMAPPED_SLOT);
+        let slot = self.s.m.bin(c, Bin::And, slot, keep);
+        let limit = self.s.m.select(c, remapped, entries, mirrored);
+        let inside = self.s.m.cmp(c, pred::IULT, slot, limit);
+        let skip = self.s.m.i32(STRIDE_HEADER);
+        let past = self.s.m.bin(c, Bin::Add, slot, skip);
+        let entry = self.s.m.select(c, inside, past, zero);
         let bytes = self.s.m.i32(StrideEntry::BYTES);
-        let at = self.s.m.bin(c, Bin::Mul, slot, bytes);
+        let at = self.s.m.bin(c, Bin::Mul, entry, bytes);
         let (iu, mask, align) = (
             self.s.m.undef(self.s.t.i32),
             self.s.m.i8(3),
@@ -385,9 +456,21 @@ impl<'a> Lower<'a> {
     /// computed in the current block (or, chosen by control flow, at the
     /// join).
     pub(super) fn lane_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+        self.lanes_heap_index(src, sampler, false)
+    }
+
+    /// [`Self::lane_heap_index`], `marked` as for [`Self::phi_heap_index`].
+    fn lanes_heap_index(&mut self, src: &Source, sampler: bool, marked: bool) -> Result<V, Why> {
         match src {
-            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
-            Source::Fetched { load, first } => self.fetched_index(*load, *first, sampler),
+            Source::Loaded { load, first } => self.index_of(*load, *first, sampler, marked),
+            Source::Fetched { load, first } => {
+                let index = self.marked_fetched_index(*load, *first, sampler)?;
+                Ok(if marked {
+                    index
+                } else {
+                    self.unmarked(index, sampler)
+                })
+            }
             Source::Lanes { mask, args } | Source::Select { scc: mask, args } => {
                 let [a, b] = &args[..] else {
                     return Err("a descriptor chosen per lane");
@@ -406,8 +489,8 @@ impl<'a> Lower<'a> {
                         _ => return Err("SCC without a value"),
                     }
                 };
-                let set = self.lane_heap_index(a, sampler)?;
-                let clear = self.lane_heap_index(b, sampler)?;
+                let set = self.lanes_heap_index(a, sampler, marked)?;
+                let clear = self.lanes_heap_index(b, sampler, marked)?;
                 Ok(self.s.m.select(self.cur, cond, set, clear))
             }
             Source::LanePhi { block, args } => {
@@ -428,7 +511,7 @@ impl<'a> Lower<'a> {
                     let index = match arg {
                         Some(arg) => {
                             let here = std::mem::replace(&mut self.cur, at);
-                            let index = self.lane_heap_index(arg, sampler);
+                            let index = self.lanes_heap_index(arg, sampler, marked);
                             self.cur = here;
                             index?
                         }
@@ -446,8 +529,9 @@ impl<'a> Lower<'a> {
 
     /// The heap index of the descriptor at dword `first` of what the global
     /// load at `load` reads, in each lane: its address (base plus offsets)
-    /// over the descriptor size.
-    pub(super) fn fetched_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+    /// over the descriptor size, with [`REMAPPED_SLOT`] where the user data
+    /// has it.
+    fn marked_fetched_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
         const WHY: Why = "a per-lane descriptor load";
         let a = *self
             .scalar
@@ -487,8 +571,37 @@ impl<'a> Lower<'a> {
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
-    /// load at `load` reads, computed in the current block.
+    /// load at `load` reads, computed in the current block: the host slot a
+    /// handle is made at ([`REMAPPED_SLOT`] cleared).
     pub(super) fn heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+        self.index_of(load, first, sampler, false)
+    }
+
+    /// [`Self::heap_index`], or with `marked` [`Self::marked_heap_index`].
+    fn index_of(&mut self, load: Site, first: u8, sampler: bool, marked: bool) -> Result<V, Why> {
+        let index = self.marked_heap_index(load, first, sampler)?;
+        Ok(if marked {
+            index
+        } else {
+            self.unmarked(index, sampler)
+        })
+    }
+
+    /// `index` without [`REMAPPED_SLOT`], in the current block, on a target
+    /// with the stride table (the host marks no index without one, and
+    /// sampler tables are never remapped).
+    fn unmarked(&mut self, index: V, sampler: bool) -> V {
+        if sampler || !self.x.target.stride_table {
+            return index;
+        }
+        let keep = self.s.m.i32(!REMAPPED_SLOT);
+        self.s.m.bin(self.cur, Bin::And, index, keep)
+    }
+
+    /// The heap index of the descriptor at dword `first` of what the scalar
+    /// load at `load` reads, as the user data gives it: with
+    /// [`REMAPPED_SLOT`] for a table the host remapped.
+    fn marked_heap_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
         let a = *self
             .scalar
             .get(&load)

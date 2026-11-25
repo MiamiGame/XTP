@@ -6,6 +6,7 @@
 pub mod asserts;
 pub mod intro;
 pub mod rpf;
+pub mod rt_path;
 pub mod sgd5;
 pub mod watchdog;
 

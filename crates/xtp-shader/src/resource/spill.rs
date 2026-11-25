@@ -1,7 +1,6 @@
 //! Compute root arguments kept behind the 40-bit pointer in entry s0:s1.
-//! Ported from VIctory (resource.rs, commit 27c3dc9d5), by Marvis and
-//! Claude Fable 5.2. The layout and high-half mask also follow fxceless's
-//! spill.rs (commit 578d459).
+//! Ported from Marvisak/VIctory (commit 27c3dc9d5) by Marvisak and Claude Fable 5.2.
+//! Disposition et masque du mot haut d'après fxceless's VIctory fork (commit 578d459).
 
 use std::collections::{HashMap, HashSet};
 
@@ -36,6 +35,142 @@ pub(super) fn has_table(native: &NativeProgram) -> bool {
 }
 
 impl Tracer<'_> {
+    /// Seules les adresses complètes, immuables à l'échelle du dispatch, peuvent
+    /// être résolues en vue D3D12 pendant l'enregistrement de la commande.
+    pub(super) fn constant_read(
+        &self,
+        inst: &crate::ir::Inst,
+        site: Site,
+    ) -> Option<super::ConstantRead> {
+        let (lo, hi, offset) = match &inst.fields {
+            Fields::Smem {
+                base: Operand::Scalar { code, .. },
+                offset,
+                soffset,
+                ..
+            } if matches!(
+                inst.name(),
+                "s_load_dword" | "s_load_dwordx2" | "s_load_dwordx4"
+            ) =>
+            {
+                let Term::Const(extra) = self.term(inst, soffset)? else {
+                    return None;
+                };
+                (
+                    self.origin(inst.read(Reg::S(*code))?),
+                    self.origin(inst.read(Reg::S(code + 1))?),
+                    extra.checked_add_signed(*offset)?,
+                )
+            }
+            Fields::Flat {
+                addr: Some(Operand::Vector { reg, .. }),
+                saddr,
+                offset,
+                lds: false,
+                ..
+            } if matches!(
+                inst.name(),
+                "global_load_dword"
+                    | "global_load_dwordx2"
+                    | "global_load_dwordx3"
+                    | "global_load_dwordx4"
+            ) && matches!(
+                saddr,
+                None | Some(Operand::Scalar {
+                    code: crate::gfx10::NULL,
+                    ..
+                })
+            ) =>
+            {
+                // Les deux copies doivent avoir été exécutées par toutes les lanes
+                // qui lisent la vue. Dans ce bloc, aucune écriture d'EXEC entre les deux.
+                let scalar_copy = |r| {
+                    let v = inst.read(Reg::V(r))?;
+                    let (b, i) = self.defs[v.0 as usize]?;
+                    if b != site.0
+                        || i >= site.1
+                        || self.p.blocks[b].insts[i..site.1].iter().any(|ins| {
+                            ins.writes
+                                .iter()
+                                .any(|(r, _)| matches!(r, Reg::S(126 | 127)))
+                        })
+                    {
+                        return None;
+                    }
+                    let copy = self.inst((b, i));
+                    let Fields::Valu(f) = &copy.fields else {
+                        return None;
+                    };
+                    if copy.name() != "v_mov_b32"
+                        || f.abs != 0
+                        || f.neg != 0
+                        || f.sdwa.is_some()
+                        || f.dpp.is_some()
+                    {
+                        return None;
+                    }
+                    self.term(copy, f.src.first()?)
+                };
+                (
+                    scalar_copy(*reg)?,
+                    scalar_copy(reg + 1)?,
+                    u32::try_from(*offset).ok()?,
+                )
+            }
+            _ => return None,
+        };
+        let (Term::Value(low), Term::Value(high)) = (lo, hi) else {
+            return None;
+        };
+        let (param, dword, packed, field) = if let Some((p, w)) = self.param_value(low) {
+            if self.param_value(high) != Some((p, w + 1)) {
+                return None;
+            }
+            (p, w, false, 0)
+        } else {
+            let (low, field) = match self.sop2(low, &["s_or_b32"]) {
+                Some((_, [Term::Const(k), Term::Value(v)] | [Term::Value(v), Term::Const(k)]))
+                    if k < 256 =>
+                {
+                    (v, k)
+                }
+                None => (low, 0),
+                _ => return None,
+            };
+            let (shift, [Term::Value(word), Term::Const(8)]) = self.sop2(low, &["s_lshl_b64"])?
+            else {
+                return None;
+            };
+            let Fields::Sop { src, .. } = &shift.fields else {
+                return None;
+            };
+            let Operand::Scalar { code, .. } = src.first()? else {
+                return None;
+            };
+            if shift.writes.get(1)?.1 != high
+                || self.origin(shift.read(Reg::S(code + 1))?) != Term::Const(0)
+            {
+                return None;
+            }
+            let (p, w) = self.param_value(word)?;
+            (p, w, true, field)
+        };
+        let root = self.layout.get(param)?;
+        let offset = offset.checked_add(field)?;
+        let end = offset.checked_add(4 * inst.writes.len() as u32)?;
+        if end > super::MISALIGNED_SRV_BYTES {
+            return None;
+        }
+        (root.root == crate::native::RootType::Constants && offset.is_multiple_of(4)).then_some(
+            super::ConstantRead {
+                slot: root.slot,
+                dword,
+                packed,
+                offset,
+            },
+        )
+    }
+
     pub(super) fn param_value(&self, v: Value) -> Option<(usize, u32)> {
         self.spill
             .bindings
