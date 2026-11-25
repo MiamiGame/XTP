@@ -64,11 +64,12 @@ impl Mode {
     }
 }
 
-/// A title callback and its context (addresses, so tasks can cross threads).
-#[derive(Clone, Copy)]
+/// A callback and context addresses, optionally owning runtime context.
+#[derive(Clone)]
 struct Task {
     context: usize,
     callback: usize,
+    owner: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl Task {
@@ -76,11 +77,24 @@ impl Task {
         Task {
             context: context as usize,
             callback: callback as usize,
+            owner: None,
+        }
+    }
+
+    /// Drops context on dispatch, rejected submission or queue disposal.
+    fn owned<T: Send + Sync + 'static>(context: T, callback: Callback) -> Task {
+        let owner = Arc::new(context);
+        Task {
+            context: Arc::as_ptr(&owner) as usize,
+            callback: callback as usize,
+            owner: Some(owner),
         }
     }
 
     fn run(self, canceled: bool) {
-        // SAFETY: built from a `Callback` in `new`.
+        // Keep owned context alive until the callback returns.
+        let _owner = self.owner;
+        // SAFETY: built from a `Callback` in our constructors.
         let callback: Callback = unsafe { std::mem::transmute(self.callback) };
         callback(self.context as *mut c_void, canceled);
     }
@@ -657,7 +671,7 @@ impl Call {
         }));
         let task = Task::new(context.cast(), routine);
         match queue(handle) {
-            Some(queue) if queue.submit(COMPLETION, 0, task) == S_OK => {
+            Some(queue) if queue.submit(COMPLETION, 0, task.clone()) == S_OK => {
                 let port = &queue.ports[COMPLETION as usize];
                 if matches!(port.mode, Mode::Manual | Mode::Serialized) {
                     let mut done = lock(&self.done);
@@ -854,25 +868,40 @@ fn begin(
 
 /// Queues the provider's `DoWork` on the block's work port.
 pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
-    extern "system" fn work(block: *mut c_void, canceled: bool) {
-        let block = block.cast::<AsyncBlock>();
-        let Some(call) = call(block) else { return };
+    extern "system" fn work(context: *mut c_void, canceled: bool) {
+        // SAFETY: Task::owned retains this tuple through the callback.
+        let (address, original) = unsafe { &*context.cast::<(usize, std::sync::Weak<Call>)>() };
+        let Some(call) = original.upgrade() else {
+            return;
+        };
+        // A completed call may still have waiters, but its provider and block
+        // may be gone. Provider/cleanup concurrency remains separate (#42).
+        if lock(&call.done).result.is_some() {
+            return;
+        }
+        let block = *address as *mut AsyncBlock;
         let hr = if canceled {
             E_ABORT
         } else {
             call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut())
         };
         if hr != E_PENDING {
-            XAsyncComplete(block, hr, 0);
+            call.complete(block, hr, 0);
         }
     }
-    if block.is_null() || call(block).is_none() {
+    let Some(call) = call(block) else {
         return E_INVALIDARG;
-    }
+    };
     // SAFETY: a block in flight is valid.
     let handle = unsafe { (*block).queue };
     match queue(handle) {
-        Some(queue) => queue.submit(WORK, delay_ms, Task::new(block.cast(), work)),
+        // Weak identity avoids a Queue -> Task -> Call -> Queue cycle when
+        // provider state owns its queue. No address lookup occurs at dispatch.
+        Some(queue) => queue.submit(
+            WORK,
+            delay_ms,
+            Task::owned((block as usize, Arc::downgrade(&call)), work),
+        ),
         None => E_INVALIDARG,
     }
 }
@@ -1642,6 +1671,297 @@ mod tests {
             "cleanup marker leaked"
         );
         assert!(waiting_call(block).is_none());
+    }
+
+    // The delayed-delivery thread has dropped its queue reference before EXIT
+    // reports its end. No sleeps are needed to observe delivery or disposal.
+    extern "system" fn queued_delivery_ended(context: *mut c_void, _: *const Queue, port: u32) {
+        if port == WORK {
+            // SAFETY: each test leaks its sender for safe failure paths.
+            let sender = unsafe { &*context.cast::<std::sync::mpsc::Sender<()>>() };
+            EXIT.with(|exit| *exit.borrow_mut() = Some(Exit(sender.clone())));
+        }
+    }
+
+    #[test]
+    fn queued_work_does_not_reach_a_reused_block() {
+        if !bounded_child("queued_work_does_not_reach_a_reused_block") {
+            return;
+        }
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the test leaks the counter through both calls.
+            let data = unsafe { &*data };
+            if op == OP_DO_WORK {
+                // SAFETY: context is the leaked counter.
+                unsafe { &*data.context.cast::<AtomicU32>() }.fetch_add(1, Ordering::SeqCst);
+            } else if op == OP_CANCEL {
+                XAsyncComplete(data.block, E_ABORT, 0);
+            }
+            S_OK
+        }
+        // Also cover a completed call still held by a waiter: upgrade succeeds,
+        // but its cleaned-up provider must not run again.
+        for (delay, canceled, keep_call) in [
+            (0, false, false),
+            (0, true, false),
+            (1, false, false),
+            (0, false, true),
+            (0, true, true),
+        ] {
+            let works = Box::leak(Box::new(AtomicU32::new(0)));
+            let mut q = std::ptr::null();
+            assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+            let block = Box::leak(Box::new(AsyncBlock {
+                queue: q,
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            }));
+            let context = (works as *mut AtomicU32).cast();
+            assert_eq!(
+                XAsyncBegin(
+                    block,
+                    context,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    Some(provider)
+                ),
+                S_OK
+            );
+            let expired = Arc::downgrade(&call(block).unwrap());
+            let retained = keep_call.then(|| call(block).unwrap());
+            let (ended, delivered) = std::sync::mpsc::channel();
+            if delay != 0 {
+                let sender = Box::leak(Box::new(ended));
+                let mut token = 0;
+                assert_eq!(
+                    XTaskQueueRegisterMonitor(
+                        q,
+                        (sender as *mut std::sync::mpsc::Sender<()>).cast(),
+                        Some(queued_delivery_ended),
+                        &mut token
+                    ),
+                    S_OK
+                );
+            }
+            assert_eq!(XAsyncSchedule(block, delay), S_OK);
+            if delay != 0 {
+                delivered
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("delayed task was not delivered");
+            }
+            let task_context = {
+                let queue = queue(q).unwrap();
+                let tasks = lock(&queue.ports[WORK as usize].tasks);
+                Arc::downgrade(tasks.front().unwrap().owner.as_ref().unwrap())
+            };
+            XAsyncCancel(block);
+            assert_eq!(XAsyncGetStatus(block, false), E_ABORT);
+            assert_eq!(
+                expired.upgrade().is_some(),
+                retained.is_some(),
+                "queued work must not keep the call alive"
+            );
+            assert_eq!(
+                XAsyncBegin(
+                    block,
+                    context,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    Some(provider)
+                ),
+                S_OK
+            );
+            if canceled {
+                assert_eq!(
+                    XTaskQueueTerminate(q, false, std::ptr::null_mut(), None),
+                    S_OK
+                );
+            } else {
+                assert!(XTaskQueueDispatch(q, WORK, 0));
+            }
+            assert!(
+                task_context.upgrade().is_none(),
+                "dispatched work leaked context"
+            );
+            assert_eq!(
+                works.load(Ordering::SeqCst),
+                0,
+                "old work invoked the new provider"
+            );
+            assert_eq!(
+                XAsyncGetStatus(block, false),
+                E_PENDING,
+                "old work completed the new call"
+            );
+            XAsyncComplete(block, S_OK, 0);
+            XTaskQueueCloseHandle(q);
+        }
+    }
+
+    #[test]
+    fn queued_work_completion_keeps_the_call_reused_by_its_callback() {
+        if !bounded_child("queued_work_completion_keeps_the_call_reused_by_its_callback") {
+            return;
+        }
+        static BEGUN: AtomicBool = AtomicBool::new(false);
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            if op == OP_DO_WORK {
+                // SAFETY: valid provider data; this completes and reuses the block.
+                XAsyncComplete(unsafe { (*data).block }, E_ABORT, 0);
+            }
+            S_OK
+        }
+        extern "system" fn completed(block: *mut AsyncBlock) {
+            // SAFETY: the test leaks its block; this callback owns reuse.
+            unsafe { (*block).callback = None };
+            BEGUN.store(
+                XAsyncBegin(
+                    block,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    Some(provider),
+                ) == S_OK,
+                Ordering::SeqCst,
+            );
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 3, &mut q), S_OK);
+        let block = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(completed),
+            internal: [0; 4],
+        }));
+        assert_eq!(
+            XAsyncBegin(
+                block,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                Some(provider)
+            ),
+            S_OK
+        );
+        let expired = Arc::downgrade(&call(block).unwrap());
+        assert_eq!(XAsyncSchedule(block, 0), S_OK);
+        assert_eq!(XAsyncSchedule(block, 0), S_OK);
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert!(BEGUN.load(Ordering::SeqCst));
+        assert_eq!(
+            XAsyncGetStatus(block, false),
+            E_PENDING,
+            "work return completed the reused call"
+        );
+        assert!(expired.upgrade().is_none());
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert_eq!(
+            XAsyncGetStatus(block, false),
+            E_PENDING,
+            "second queued task reached the reused call"
+        );
+        XAsyncComplete(block, S_OK, 0);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn queued_work_releases_context_on_rejection_and_queue_disposal() {
+        if !bounded_child("queued_work_releases_context_on_rejection_and_queue_disposal") {
+            return;
+        }
+        extern "system" fn idle(_: u32, _: *const ProviderData) -> HRESULT {
+            S_OK
+        }
+        for delay in [0, 1] {
+            let mut q = std::ptr::null();
+            assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+            let block = Box::leak(Box::new(AsyncBlock {
+                queue: q,
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            }));
+            assert_eq!(
+                XAsyncBegin(
+                    block,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    Some(idle)
+                ),
+                S_OK
+            );
+            let expired = Arc::downgrade(&call(block).unwrap());
+            let (ended, delivered) = std::sync::mpsc::channel();
+            if delay != 0 {
+                let sender = Box::leak(Box::new(ended));
+                let mut token = 0;
+                assert_eq!(
+                    XTaskQueueRegisterMonitor(
+                        q,
+                        (sender as *mut std::sync::mpsc::Sender<()>).cast(),
+                        Some(queued_delivery_ended),
+                        &mut token
+                    ),
+                    S_OK
+                );
+            }
+            assert_eq!(XAsyncSchedule(block, delay), S_OK);
+            if delay != 0 {
+                delivered
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("delayed delivery did not finish");
+            }
+            let context = {
+                let queue = queue(q).unwrap();
+                let tasks = lock(&queue.ports[WORK as usize].tasks);
+                Arc::downgrade(tasks.front().unwrap().owner.as_ref().unwrap())
+            };
+            XAsyncComplete(block, E_ABORT, 0);
+            assert!(expired.upgrade().is_none(), "queued work retained the call");
+            assert!(context.upgrade().is_some());
+            XTaskQueueCloseHandle(q);
+            assert!(
+                context.upgrade().is_none(),
+                "disposed work leaked its context"
+            );
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let block = Box::leak(Box::new(AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }));
+        let call = begin(block, std::ptr::null_mut(), std::ptr::null(), idle).unwrap();
+        assert_eq!(
+            XTaskQueueTerminate(q, false, std::ptr::null_mut(), None),
+            S_OK
+        );
+        assert_eq!(XAsyncSchedule(block, 0), E_ABORT);
+        assert_eq!(
+            Arc::weak_count(&call),
+            0,
+            "rejected work leaked its context"
+        );
+        call.complete(block, E_ABORT, 0);
+        drop(call);
+        XTaskQueueCloseHandle(q);
+        // Model #42's reverse ownership edge: a call owning its queue must
+        // still die while that queue holds a task referring weakly to it.
+        extern "system" fn unused(_: *mut c_void, _: bool) {}
+        let queue = Queue::new([Port::new(Mode::Manual), Port::new(Mode::Manual)]);
+        let owns_queue = Arc::new(queue.clone());
+        let expired = Arc::downgrade(&owns_queue);
+        queue.ports[WORK as usize].submit(Task::owned(expired.clone(), unused));
+        drop(owns_queue);
+        assert!(
+            expired.upgrade().is_none(),
+            "task formed an ownership cycle"
+        );
+        assert_eq!(Arc::strong_count(&queue), 1);
     }
 
     fn slot<F: Copy>(offset: usize) -> F {
