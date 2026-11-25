@@ -130,8 +130,128 @@ pub struct Connection {
     state: Mutex<State>,
 }
 
+/// Maximum number of Opus streams captured under `XTP_APU_DUMP`.
+#[cfg(feature = "diagnostics")]
+const MAX_DUMP_STREAMS: u32 = 32;
+
+/// Maximum number of Opus packets appended per captured stream.
+#[cfg(feature = "diagnostics")]
+const MAX_DUMP_PACKETS: u32 = 256;
+
+/// Magic header for `.opuscap` packet capture files (`"XOPU"` + `u16` channels + `u16` 0).
+pub const CAPTURE_MAGIC: [u8; 4] = *b"XOPU";
+
+/// Appends one length-prefixed Opus packet to `path`, writing the 8-byte
+/// `XOPU` header if the file is new.
+pub fn append_capture_packet(
+    path: &std::path::Path,
+    channels: u16,
+    packet: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let is_new = !path.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    if is_new {
+        file.write_all(&CAPTURE_MAGIC)?;
+        file.write_all(&channels.to_le_bytes())?;
+        file.write_all(&0u16.to_le_bytes())?;
+    }
+    let len = u32::try_from(packet.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "packet too large"))?;
+    file.write_all(&len.to_le_bytes())?;
+    file.write_all(packet)?;
+    Ok(())
+}
+
+/// Parses a `.opuscap` file written by [`append_capture_packet`] into
+/// `(channels, packets)`.
+pub fn read_capture_file(path: &std::path::Path) -> std::io::Result<(u16, Vec<Vec<u8>>)> {
+    let data = std::fs::read(path)?;
+    if data.len() < 8 || data[..4] != CAPTURE_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not an XOPU capture file",
+        ));
+    }
+    let channels = u16::from_le_bytes([data[4], data[5]]);
+    if !(1..=2).contains(&channels) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported channel count {channels}"),
+        ));
+    }
+    let mut packets = Vec::new();
+    let mut pos = 8;
+    while pos + 4 <= data.len() {
+        let len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + len > data.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated Opus packet in capture file",
+            ));
+        }
+        packets.push(data[pos..pos + len].to_vec());
+        pos += len;
+    }
+    Ok((channels, packets))
+}
+
+/// `XTP_APU_DUMP=<dir>`: saves the Opus packets queued on the first 32
+/// streams (up to 256 packets per stream) into `<n>-s<stream>-<ch>ch.opuscap`,
+/// for offline comparison against Windows' Opus MFT.
+#[cfg(feature = "diagnostics")]
+struct StreamDump {
+    path: std::path::PathBuf,
+    channels: u16,
+    written: u32,
+}
+
+#[cfg(feature = "diagnostics")]
+impl StreamDump {
+    fn open(stream: usize, channels: u16) -> Option<Self> {
+        static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::path::PathBuf::from(std::env::var_os("XTP_APU_DUMP")?);
+        if let Err(e) = xtp_core::ensure_outside_repo(&dir) {
+            tracing::warn!(%e, "XTP_APU_DUMP refuses to write inside the repository");
+            return None;
+        }
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n >= MAX_DUMP_STREAMS {
+            return None;
+        }
+        if std::fs::create_dir_all(&dir).is_err() {
+            return None;
+        }
+        let path = dir.join(format!("{n:02}-s{stream}-{channels}ch.opuscap"));
+        Some(Self {
+            path,
+            channels,
+            written: 0,
+        })
+    }
+
+    fn record(&mut self, packet: &[u8]) {
+        if self.written >= MAX_DUMP_PACKETS {
+            return;
+        }
+        if append_capture_packet(&self.path, self.channels, packet).is_ok() {
+            self.written += 1;
+        }
+    }
+}
+
+struct StreamSlot {
+    decoder: OpusDecoder,
+    #[cfg(feature = "diagnostics")]
+    dump: Option<StreamDump>,
+}
+
 struct State {
-    streams: Vec<Option<OpusDecoder>>,
+    streams: Vec<Option<StreamSlot>>,
     /// Results not yet dequeued, per stream.
     queued: Vec<u32>,
     results: VecDeque<ApuResult>,
@@ -274,7 +394,11 @@ pub extern "system" fn XApuEnqueueCommand(
             } else {
                 match OpusDecoder::new(48_000, channels as usize) {
                     Ok(d) if (1..=2).contains(&channels) => {
-                        *decoder = Some(d);
+                        *decoder = Some(StreamSlot {
+                            decoder: d,
+                            #[cfg(feature = "diagnostics")]
+                            dump: StreamDump::open(stream, channels as u16),
+                        });
                         S_OK
                     }
                     _ => E_INVALIDARG,
@@ -283,8 +407,8 @@ pub extern "system" fn XApuEnqueueCommand(
         }
         DEACTIVATE => *decoder = None,
         RESET => {
-            if let Some(d) = decoder {
-                let _ = d.reset_state();
+            if let Some(slot) = decoder {
+                let _ = slot.decoder.reset_state();
             }
         }
         NOTIFY => {}
@@ -292,7 +416,7 @@ pub extern "system" fn XApuEnqueueCommand(
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
+                Some(slot) => process(slot, connection.options, &command, &mut result),
                 None => result.error = INVALID_STREAM,
             }
         }
@@ -314,7 +438,8 @@ pub extern "system" fn XApuEnqueueCommand(
 
 /// Decodes one packet into the command's output buffer, keeping the frames
 /// from `first_frame` on, at most `frame_count` of them.
-fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+fn process(slot: &mut StreamSlot, options: u32, command: &Process, result: &mut ApuResult) {
+    let decoder = &mut slot.decoder;
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
     let (output, output_length) = (command.output, command.output_length);
@@ -327,6 +452,10 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
+    #[cfg(feature = "diagnostics")]
+    if let Some(dump) = &mut slot.dump {
+        dump.record(packet);
+    }
     let mut pcm = vec![0f32; MAX_FRAMES * channels];
     let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
         Ok(n) => n,
