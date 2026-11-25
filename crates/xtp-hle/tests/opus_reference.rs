@@ -15,7 +15,9 @@ use std::path::PathBuf;
 
 use opus_pure::{Application, OpusDecoder, OpusEncoder};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExA,
+};
 use xtp_hle::modules::apu;
 
 const MIN_SNR_DB: f64 = 60.0;
@@ -131,10 +133,13 @@ const IID_IMF_TRANSFORM: Guid = Guid::new(
 );
 
 const MF_VERSION: u32 = (0x0002 << 16) | 0x0070;
-const MFT_ENUM_FLAG_ALL: u32 = 0x0000_003f;
+const MFT_ENUM_FLAG_SYNCMFT: u32 = 0x0000_0001;
+const MFT_ENUM_FLAG_LOCALMFT: u32 = 0x0000_0010;
 const MFT_ENUM_FLAG_SORTANDFILTER: u32 = 0x0000_0040;
+const MFT_MESSAGE_COMMAND_DRAIN: u32 = 0x0000_0001;
 const MFT_MESSAGE_NOTIFY_BEGIN_STREAMING: u32 = 0x1000_0000;
 const MFT_MESSAGE_NOTIFY_START_OF_STREAM: u32 = 0x1000_0003;
+const MF_E_TRANSFORM_STREAM_CHANGE: i32 = 0xC00D_6D61_u32 as i32;
 const MF_E_TRANSFORM_NEED_MORE_INPUT: i32 = 0xC00D_6D72_u32 as i32;
 
 type FnMfStartup = unsafe extern "system" fn(u32, u32) -> i32;
@@ -153,9 +158,37 @@ type FnMfCreateMemoryBuffer = unsafe extern "system" fn(u32, *mut *mut c_void) -
 type FnCoTaskMemFree = unsafe extern "system" fn(*mut c_void);
 type FnCoInitializeEx = unsafe extern "system" fn(*mut c_void, u32) -> i32;
 
+struct DllGuard(HMODULE);
+
+impl DllGuard {
+    fn load_system(name: &std::ffi::CStr) -> Option<Self> {
+        // SAFETY: `name` is a NUL-terminated system DLL filename; restricting
+        // search to System32 avoids loading untrusted DLLs from CWD.
+        let handle = unsafe {
+            LoadLibraryExA(
+                name.as_ptr().cast(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if handle.is_null() {
+            None
+        } else {
+            Some(Self(handle))
+        }
+    }
+}
+
+impl Drop for DllGuard {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is a valid non-null module handle from `LoadLibraryExA`.
+        unsafe { FreeLibrary(self.0) };
+    }
+}
+
 struct MfApi {
-    mfplat: HMODULE,
-    ole32: HMODULE,
+    _ole32: DllGuard,
+    _mfplat: DllGuard,
     mf_shutdown: FnMfShutdown,
     mft_enum_ex: FnMftEnumEx,
     create_media_type: FnMfCreateMediaType,
@@ -173,38 +206,27 @@ impl MfApi {
             Some(unsafe { std::mem::transmute_copy(&p) })
         }
 
-        // SAFETY: NUL-terminated system DLL names.
-        let mfplat = unsafe { LoadLibraryA(c"mfplat.dll".as_ptr().cast()) };
-        if mfplat.is_null() {
-            return None;
-        }
-        // SAFETY: NUL-terminated system DLL name.
-        let ole32 = unsafe { LoadLibraryA(c"ole32.dll".as_ptr().cast()) };
-        if ole32.is_null() {
-            // SAFETY: `mfplat` was loaded above.
-            unsafe { FreeLibrary(mfplat) };
-            return None;
-        }
-        // SAFETY: loading standard Media Foundation / COM entry points.
+        let mfplat = DllGuard::load_system(c"mfplat.dll")?;
+        let ole32 = DllGuard::load_system(c"ole32.dll")?;
+        // SAFETY: loading standard Media Foundation / COM entry points; `DllGuard`
+        // frees both module handles on any early return.
         let loaded = unsafe {
-            let startup: FnMfStartup = sym(mfplat, b"MFStartup\0")?;
-            let mf_shutdown: FnMfShutdown = sym(mfplat, b"MFShutdown\0")?;
-            let mft_enum_ex: FnMftEnumEx = sym(mfplat, b"MFTEnumEx\0")?;
-            let create_media_type: FnMfCreateMediaType = sym(mfplat, b"MFCreateMediaType\0")?;
-            let create_sample: FnMfCreateSample = sym(mfplat, b"MFCreateSample\0")?;
+            let startup: FnMfStartup = sym(mfplat.0, b"MFStartup\0")?;
+            let mf_shutdown: FnMfShutdown = sym(mfplat.0, b"MFShutdown\0")?;
+            let mft_enum_ex: FnMftEnumEx = sym(mfplat.0, b"MFTEnumEx\0")?;
+            let create_media_type: FnMfCreateMediaType = sym(mfplat.0, b"MFCreateMediaType\0")?;
+            let create_sample: FnMfCreateSample = sym(mfplat.0, b"MFCreateSample\0")?;
             let create_memory_buffer: FnMfCreateMemoryBuffer =
-                sym(mfplat, b"MFCreateMemoryBuffer\0")?;
-            let co_task_mem_free: FnCoTaskMemFree = sym(ole32, b"CoTaskMemFree\0")?;
-            let co_init: FnCoInitializeEx = sym(ole32, b"CoInitializeEx\0")?;
+                sym(mfplat.0, b"MFCreateMemoryBuffer\0")?;
+            let co_task_mem_free: FnCoTaskMemFree = sym(ole32.0, b"CoTaskMemFree\0")?;
+            let co_init: FnCoInitializeEx = sym(ole32.0, b"CoInitializeEx\0")?;
             let _ = co_init(std::ptr::null_mut(), 0); // COINIT_MULTITHREADED
             if startup(MF_VERSION, 0) < 0 {
-                FreeLibrary(ole32);
-                FreeLibrary(mfplat);
                 return None;
             }
             Self {
-                mfplat,
-                ole32,
+                _ole32: ole32,
+                _mfplat: mfplat,
                 mf_shutdown,
                 mft_enum_ex,
                 create_media_type,
@@ -219,11 +241,10 @@ impl MfApi {
 
 impl Drop for MfApi {
     fn drop(&mut self) {
-        // SAFETY: paired with `MFStartup` and `LoadLibraryA` in `load()`.
+        // SAFETY: paired with `MFStartup` in `load()`; runs before `_ole32` and
+        // `_mfplat` fields are dropped.
         unsafe {
             (self.mf_shutdown)();
-            FreeLibrary(self.ole32);
-            FreeLibrary(self.mfplat);
         }
     }
 }
@@ -266,7 +287,7 @@ impl WindowsOpusMft {
         let hr = unsafe {
             (mf.mft_enum_ex)(
                 MFT_CATEGORY_AUDIO_DECODER,
-                MFT_ENUM_FLAG_ALL | MFT_ENUM_FLAG_SORTANDFILTER,
+                MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER,
                 &input_filter,
                 std::ptr::null(),
                 &mut activates,
@@ -274,7 +295,6 @@ impl WindowsOpusMft {
             )
         };
         if hr < 0 || count == 0 || activates.is_null() {
-            eprintln!("opus MFT enum: hr={hr:#x} count={count}");
             return None;
         }
 
@@ -363,10 +383,23 @@ impl WindowsOpusMft {
         // SAFETY: releasing temporary media type.
         unsafe { com_release(in_mt) };
         if hr_in < 0 {
-            eprintln!("opus MFT SetInputType failed: hr={hr_in:#x}");
+            return false;
+        }
+        if !self.select_output_type() {
             return false;
         }
 
+        // SAFETY: `IMFTransform::ProcessMessage` is slot 23.
+        unsafe {
+            let msg: unsafe extern "system" fn(*mut c_void, u32, usize) -> i32 =
+                vtable_slot(self.transform, 23);
+            let _ = msg(self.transform, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+            let _ = msg(self.transform, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        }
+        true
+    }
+
+    fn select_output_type(&self) -> bool {
         // Output type: query available types for IEEE float PCM, else construct one.
         let mut selected_out = std::ptr::null_mut();
         for idx in 0..16u32 {
@@ -436,19 +469,7 @@ impl WindowsOpusMft {
         };
         // SAFETY: releasing temporary media type.
         unsafe { com_release(selected_out) };
-        if hr_out < 0 {
-            eprintln!("opus MFT SetOutputType failed: hr={hr_out:#x}");
-            return false;
-        }
-
-        // SAFETY: `IMFTransform::ProcessMessage` is slot 23.
-        unsafe {
-            let msg: unsafe extern "system" fn(*mut c_void, u32, usize) -> i32 =
-                vtable_slot(self.transform, 23);
-            let _ = msg(self.transform, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-            let _ = msg(self.transform, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-        }
-        true
+        hr_out >= 0
     }
 
     fn decode_packet(&self, packet: &[u8]) -> Result<Vec<f32>, i32> {
@@ -500,6 +521,24 @@ impl WindowsOpusMft {
             }
         }
 
+        let mut samples = Vec::new();
+        self.drain_output(&mut samples)?;
+        Ok(samples)
+    }
+
+    fn drain(&self) -> Result<Vec<f32>, i32> {
+        // SAFETY: `IMFTransform::ProcessMessage` is slot 23.
+        unsafe {
+            let msg: unsafe extern "system" fn(*mut c_void, u32, usize) -> i32 =
+                vtable_slot(self.transform, 23);
+            let _ = msg(self.transform, MFT_MESSAGE_COMMAND_DRAIN, 0);
+        }
+        let mut samples = Vec::new();
+        self.drain_output(&mut samples)?;
+        Ok(samples)
+    }
+
+    fn drain_output(&self, samples: &mut Vec<f32>) -> Result<(), i32> {
         // Query whether the MFT allocates its own output samples.
         #[repr(C)]
         struct MftOutputStreamInfo {
@@ -522,7 +561,6 @@ impl WindowsOpusMft {
             get_osi(self.transform, 0, &mut osi) >= 0 && (osi.flags & 0x300) != 0
         };
 
-        let mut samples = Vec::new();
         loop {
             let mut caller_buf = std::ptr::null_mut();
             let mut caller_sample = std::ptr::null_mut();
@@ -568,6 +606,14 @@ impl WindowsOpusMft {
                 if !odb.events.is_null() {
                     com_release(odb.events);
                 }
+                if hr == MF_E_TRANSFORM_STREAM_CHANGE {
+                    com_release(caller_sample);
+                    com_release(caller_buf);
+                    if !self.select_output_type() {
+                        return Err(hr);
+                    }
+                    continue;
+                }
                 if hr == MF_E_TRANSFORM_NEED_MORE_INPUT {
                     com_release(caller_sample);
                     com_release(caller_buf);
@@ -595,12 +641,12 @@ impl WindowsOpusMft {
                             vtable_slot(cont_buf, 4);
                         let mut ptr = std::ptr::null_mut();
                         let mut cur_len = 0u32;
-                        if lock(cont_buf, &mut ptr, std::ptr::null_mut(), &mut cur_len) >= 0
-                            && cur_len >= 4
-                        {
-                            let bytes = std::slice::from_raw_parts(ptr, cur_len as usize);
-                            for &chunk in bytes.as_chunks::<4>().0 {
-                                samples.push(f32::from_le_bytes(chunk));
+                        if lock(cont_buf, &mut ptr, std::ptr::null_mut(), &mut cur_len) >= 0 {
+                            if cur_len >= 4 {
+                                let bytes = std::slice::from_raw_parts(ptr, cur_len as usize);
+                                for &chunk in bytes.as_chunks::<4>().0 {
+                                    samples.push(f32::from_le_bytes(chunk));
+                                }
                             }
                             let _ = unlock(cont_buf);
                         }
@@ -611,7 +657,7 @@ impl WindowsOpusMft {
                 com_release(caller_buf);
             }
         }
-        Ok(samples)
+        Ok(())
     }
 }
 
@@ -658,6 +704,8 @@ fn compare_stream(channels: usize, packets: &[Vec<u8>], label: &str) {
         let decoded_mft = mft.decode_packet(pkt).expect("Windows Opus MFT decode");
         mft_pcm.extend_from_slice(&decoded_mft);
     }
+    let drained = mft.drain().expect("Windows Opus MFT drain");
+    mft_pcm.extend_from_slice(&drained);
 
     assert_eq!(
         pure_pcm.len(),
@@ -704,6 +752,12 @@ fn opus_pure_matches_windows_mft_on_synthetic_streams() {
     for channels in [1usize, 2] {
         let packets = synth_packets(channels, 10);
         let path = dir.path().join(format!("synth-{channels}ch.opuscap"));
+        // Seed a stale capture with a different channel count to verify
+        // `create_capture_file` truncates instead of concatenating runs.
+        apu::create_capture_file(&path, if channels == 1 { 2 } else { 1 }).unwrap();
+        apu::append_capture_packet(&path, if channels == 1 { 2 } else { 1 }, &[0xAA, 0xBB])
+            .unwrap();
+        apu::create_capture_file(&path, channels as u16).unwrap();
         for pkt in &packets {
             apu::append_capture_packet(&path, channels as u16, pkt).unwrap();
         }

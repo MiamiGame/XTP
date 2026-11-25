@@ -141,24 +141,29 @@ const MAX_DUMP_PACKETS: u32 = 256;
 /// Magic header for `.opuscap` packet capture files (`"XOPU"` + `u16` channels + `u16` 0).
 pub const CAPTURE_MAGIC: [u8; 4] = *b"XOPU";
 
-/// Appends one length-prefixed Opus packet to `path`, writing the 8-byte
-/// `XOPU` header if the file is new.
+/// Creates (or truncates) `path` and writes the 8-byte `"XOPU"` header for
+/// `channels`.
+pub fn create_capture_file(path: &std::path::Path, channels: u16) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&CAPTURE_MAGIC)?;
+    file.write_all(&channels.to_le_bytes())?;
+    file.write_all(&0u16.to_le_bytes())?;
+    Ok(())
+}
+
+/// Appends one length-prefixed Opus packet to `path`, creating the 8-byte
+/// `XOPU` header first if the file does not exist yet.
 pub fn append_capture_packet(
     path: &std::path::Path,
     channels: u16,
     packet: &[u8],
 ) -> std::io::Result<()> {
     use std::io::Write;
-    let is_new = !path.exists();
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    if is_new {
-        file.write_all(&CAPTURE_MAGIC)?;
-        file.write_all(&channels.to_le_bytes())?;
-        file.write_all(&0u16.to_le_bytes())?;
+    if !path.exists() {
+        create_capture_file(path, channels)?;
     }
+    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
     let len = u32::try_from(packet.len())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "packet too large"))?;
     file.write_all(&len.to_le_bytes())?;
@@ -215,18 +220,19 @@ impl StreamDump {
     fn open(stream: usize, channels: u16) -> Option<Self> {
         static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let dir = std::path::PathBuf::from(std::env::var_os("XTP_APU_DUMP")?);
-        if let Err(e) = xtp_core::ensure_outside_repo(&dir) {
-            tracing::warn!(%e, "XTP_APU_DUMP refuses to write inside the repository");
-            return None;
-        }
         let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n >= MAX_DUMP_STREAMS {
+            return None;
+        }
+        if let Err(e) = xtp_core::ensure_outside_repo(&dir) {
+            tracing::warn!(%e, "XTP_APU_DUMP refuses to write inside the repository");
             return None;
         }
         if std::fs::create_dir_all(&dir).is_err() {
             return None;
         }
         let path = dir.join(format!("{n:02}-s{stream}-{channels}ch.opuscap"));
+        create_capture_file(&path, channels).ok()?;
         Some(Self {
             path,
             channels,
