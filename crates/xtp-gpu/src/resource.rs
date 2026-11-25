@@ -3477,6 +3477,7 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    type AddRef = extern "system" fn(This) -> u32;
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
     type Address = extern "system" fn(This) -> u64;
@@ -4744,6 +4745,13 @@ mod tests {
         let target = at(address, &ResourceDesc { flags: 1, ..plain });
         let view = words(&plain, [0, 0]);
         let shown = texture_at(address, &view).unwrap();
+        // The view's resource is released when the title's new texture takes
+        // its place, and the queue it waits in is the process's: a test beside
+        // this one that drains it (`release_waiting`) frees the resource
+        // before the check below, and the next one made can take its address.
+        // Our own reference keeps `shown` alive, so `now != shown` is about
+        // the view's resource, not about where the allocator puts the next.
+        assert_eq!(slot::<AddRef>(shown, 0x08)(shown), 2);
         assert!(same_copy(shown, target));
         let drawn = host_copy(target).unwrap();
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
@@ -4761,6 +4769,9 @@ mod tests {
         assert_eq!(slot::<Release>(streamed, 0x10)(streamed), 0);
         memory_remapped(address as usize, KIB_64 as usize);
         release_waiting(std::time::Duration::ZERO);
+        // The queue's reference goes here or in another test, still on its
+        // way out maybe: ours is the one left to give back.
+        slot::<Release>(shown, 0x10)(shown);
     }
 
     /// Textures the title fills itself are placed in the texture pool;
