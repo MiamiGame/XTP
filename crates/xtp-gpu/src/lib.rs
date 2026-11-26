@@ -92,6 +92,8 @@ pub mod signature;
 mod testgpu;
 #[cfg(windows)]
 mod texture;
+#[cfg(all(windows, test))]
+mod texture_commit_probe;
 #[cfg(windows)]
 mod timestamps;
 #[cfg(windows)]

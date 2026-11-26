@@ -220,6 +220,61 @@ time, VidMm peak (the reserve must not push Series S past the ceiling), and
 "handed out before their heap was resident" in the frame line (textures that
 may have got null views).
 
+### 3.4 Commit per driver
+
+The probe creates 32 synthetic 4096 × 4096 RGBA8 DEFAULT textures (64 MiB
+each, 2 GiB total on the adapters below). It takes a fresh baseline for
+each allocation group and samples process `PrivateUsage` and
+`PagefileUsage`, system `CommitTotal`, and DXGI local and non-local usage
+500 ms after each step and 2.5 s after release. A queue fence completes
+each batch of tile mappings or unmappings before the corresponding sample,
+and the backing heap stays alive through the unmap sample.
+
+Run the ignored test by itself on a quiet machine with 2 GiB of available
+commit plus driver overhead. Use `hardware` for the default hardware
+adapter and `warp` for the software adapter.
+
+```powershell
+$env:XTP_TEST_ADAPTER = 'hardware'  # or 'warp'
+$env:XTP_BUFFER_POOL = '0'          # keep the test host's buffer heaps out of the samples
+cargo test -p xtp-gpu --lib texture_commit_probe -- --ignored --nocapture
+```
+
+| Adapter | Driver (DXGI UMD) | Software | Windows build |
+| --- | --- | --- | --- |
+| NVIDIA GeForce RTX 5070 | 32.0.16.1664 | No | 26200.9974 (25H2) |
+| Microsoft Basic Render Driver (WARP) | 10.0.26100.9818 | Yes | 26200.9974 (25H2) |
+
+Each cell gives the deltas in MiB in this order: `PrivateUsage`,
+`PagefileUsage`, `CommitTotal`, DXGI local, DXGI non-local.
+
+| Case | RTX 5070 | WARP |
+| --- | --- | --- |
+| Committed with `CREATE_NOT_RESIDENT` | +2052.21, +2052.21, +2065.82, +0.00, +0.00 | +2052.14, +2052.14, +1947.29, +0.00, +0.00 |
+| Committed after `MakeResident` | +2052.21, +2052.21, +2047.96, +2048.00, +0.00 | +2052.14, +2052.14, +1773.88, +2048.00, +0.00 |
+| Committed after `Evict` | +2052.21, +2052.21, +2067.11, +0.00, +0.00 | +2052.14, +2052.14, +1787.19, +0.00, +0.00 |
+| Released committed textures after `Evict` | +192.59, +192.59, +195.76, +0.00, +0.00 | +192.45, +192.45, +471.07, +0.00, +0.00 |
+| Placed heap alone | +1859.63, +1859.63, +1866.71, +2048.00, +0.00 | +1859.64, +1859.64, +1924.69, +2048.00, +0.00 |
+| Placed heap with 32 textures | +1859.84, +1859.84, +1872.93, +2048.00, +0.00 | +1859.70, +1859.70, +1968.35, +2048.00, +0.00 |
+| Released placed textures and heap | -192.17, -192.17, +337.78, +0.00, +0.00 | -192.32, -192.32, +185.29, +0.00, +0.00 |
+| Reserved, no tiles mapped | +0.00, +0.00, +137.07, +0.00, +0.00 | +4.52, +4.52, +585.59, +0.00, +0.00 |
+| Reserved, all tiles mapped to one heap | +2052.10, +2052.10, +2193.82, +2048.00, +0.00 | +2056.70, +2056.70, +2752.62, +2048.00, +0.00 |
+| Reserved after unmapping, heap still live | +2052.10, +2052.10, +2496.47, +2048.00, +0.00 | +2056.75, +2056.75, +2802.84, +2048.00, +0.00 |
+| Released reserved textures and heap | +0.07, +0.07, +41.64, +0.00, +0.00 | +4.39, +4.39, +1048.02, +0.00, +0.00 |
+| Committed, resident at creation | +2052.03, +2052.03, +1931.58, +2048.00, +0.00 | +2052.12, +2052.12, +2087.90, +2048.00, +0.00 |
+| Released committed textures created resident | +192.41, +192.41, +316.20, +0.00, +0.00 | +192.50, +192.50, +431.05, +0.00, +0.00 |
+
+Process commit stayed near 2 GiB through `MakeResident` and `Evict` on
+both adapters. Unmapping the tiles left the backing heap charged until
+release. Roughly 193 MiB of process commit remained after releasing the
+first committed batch and carried into the placed-heap baseline, which
+helps explain its lower process deltas. System `CommitTotal` includes
+other processes, so it varied even after the resources were released.
+
+This answers part of [#74](https://github.com/MiamiGame/XTP/issues/74).
+Measurements on more drivers are wanted, especially AMD, Intel, older
+NVIDIA drivers, and adapters with shared memory.
+
 ## 4. Review items of dark-world's delivery (Samuel's relay)
 
 1. Residency fences in order: one fence a request (2.3).
