@@ -2038,6 +2038,9 @@ mod tests {
             let kernel = Kernel::new(host);
             let [scratch, data, read, a, b] = [(); 5].map(|()| TitleBuffer::new(256));
             let (graphics, compute) = (new_queue(0), new_queue(2));
+            // Exercise queue ordering without the stuck-queue fallback.
+            lock(&queue(graphics).line).wait_indefinitely = true;
+            lock(&queue(compute).line).wait_indefinitely = true;
             let (g0, g1) = (TitleList::new(), TitleList::new());
             write_value(&g0, a.address(), 1);
             wait_for(&g1, b.address(), 1);
@@ -2125,6 +2128,8 @@ mod tests {
             let kernel = Kernel::new(host);
             let (scratch, out) = (TitleBuffer::new(256), TitleBuffer::new(256));
             let (graphics, fence) = (new_queue(0), new_fence());
+            // Only the present should release this unsignalled wait.
+            lock(&queue(graphics).line).wait_indefinitely = true;
             assert_eq!(wait(graphics, fence, 1), S_OK);
             let list = TitleList::new();
             kernel.dispatch(list.host(), Pass::Fill, scratch.address(), out.address());
