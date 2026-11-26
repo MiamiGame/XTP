@@ -112,8 +112,10 @@ names are truncated. Both notifications continue normal exception dispatch.
 Both observers return before any decoding or allocation once process exit
 has begun, because terminated threads may still hold allocator or I/O locks.
 
-`xtp census` shows this classification without running anything (it
-does not map title DLLs; `xtp run` without `--execute` does).
+`xtp census` reads the exports of eligible DLLs in each title folder
+without mapping them or running title code. It retries unresolved
+ordinals by name and shows which remaining imports have values in the
+built-in stub table.
 
 ## Shaders
 

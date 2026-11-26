@@ -142,10 +142,21 @@ fields `machine`, `image_base` and `entry_rva`, numeric fields `subsystem` and
 objects (`delay` is a boolean; `resolution` is `"hle"`, `"host"`, `"missing"`,
 with `"title"` reserved because static `inspect` does not map title-shipped
 DLLs, so those report as `"missing"`). `--json` ignores `--imports` and
-`--exports`. `xtp census --json` emits `"format": "xtp-census 1"` with numeric
-`images`, `unreadable`, `totals` (`{functions, hle, host, missing}`), a `dlls`
-array (`{dll, functions, hle, host, missing, images}`), and always includes the
-`missing` array (`{dll, symbol, images}`). The `format` version number
+`--exports`.
+
+`xtp census` classifies imports as HLE, host, title DLL, table-stubbed, or
+missing. Each folder is scanned independently, without subfolders. A file
+is scanned as one image with no title DLLs available. With no paths, census
+uses the configured game and test-title folders. When a pair has different
+outcomes across inputs, the totals count it once under the last applicable
+class in that order. `--strict` disables host pass-through.
+
+`xtp census --json` emits `"format": "xtp-census 1"` with numeric `images` and
+`unreadable` fields, a `totals` object
+(`{functions, hle, host, title, stubbed, missing}`), a `dlls` array
+(`{dll, functions, hle, host, title, stubbed, missing, images}`), and
+`missing` and `stubbed` arrays (each with `{dll, symbol, images}` rows).
+Each array counts the images in its class. The `format` version number
 increments on any breaking schema change.
 
 The title sees an Xbox Series S unless `--console series-x` or

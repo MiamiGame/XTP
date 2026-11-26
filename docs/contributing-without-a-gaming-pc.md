@@ -260,8 +260,8 @@ model for this work: code named by RVA, behaviour in our own words.
 
 ```powershell
 xtp inspect "<title folder>\<executable>"      # blake3: your build's identity
-xtp census "<title folder>" --missing          # imports XTP does not serve, most used first
-xtp census "<title folder>" --missing --strict # host pass-through not counted as covered
+xtp census "<title folder>" --missing          # missing and table-stubbed imports, listed separately
+xtp census "<title folder>" --missing --strict # disable host pass-through
 ```
 
 - The docs' RVAs are for build 1.0.2.1 (image base `0x140000000`), whose

@@ -362,8 +362,7 @@ fn register_builder(name: &str, dir: &Path) -> Result<()> {
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
-#[cfg(windows)]
-fn title_dll(host: &xtp_hle::HostPolicy, dll: &str) -> bool {
+pub(crate) fn title_dll(host: &xtp_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !xtp_hle::registry().iter().any(|m| m.serves(dll))
 }
 

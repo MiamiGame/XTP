@@ -44,15 +44,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Aggregate the imports of every PE image under the given paths and
-    /// show which ones our runtime covers. Defaults to the configured
-    /// game and test-title directories.
+    /// Classify imports as the loader binds them.
     Census {
+        /// Each folder is a separate title, scanned without subfolders.
+        /// A file is one image with no title DLLs available. Defaults to
+        /// the configured game and test-title folders.
         paths: Vec<PathBuf>,
         /// Do not count host pass-through as covered.
         #[arg(long)]
         strict: bool,
-        /// List every missing `dll!function`, most used first.
+        /// List missing and table-stubbed imports separately, most used first.
         #[arg(long)]
         missing: bool,
         /// Emit stable JSON instead of the text table.
